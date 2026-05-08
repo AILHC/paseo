@@ -1222,6 +1222,10 @@ function normalizeCodexThreadItemType(rawType: string | undefined): string | und
       return "imageView";
     case "ImageGeneration":
       return "imageGeneration";
+    case "ContextCompaction":
+    case "context_compaction":
+    case "compaction":
+      return "contextCompaction";
     default:
       return rawType;
   }
@@ -1677,6 +1681,8 @@ function threadItemToTimeline(
       return mapCodexThreadPlanItem(normalizedItem);
     case "reasoning":
       return mapCodexThreadReasoningItem(normalizedItem);
+    case "contextCompaction":
+      return { type: "compaction", status: "completed" };
     default:
       return null;
   }
@@ -1787,6 +1793,13 @@ function normalizeImageData(mimeType: string, data: string): ImageDataPayload {
 const ThreadStartedNotificationSchema = z
   .object({
     thread: z.object({ id: z.string() }).passthrough(),
+  })
+  .passthrough();
+
+const ThreadCompactedNotificationSchema = z
+  .object({
+    threadId: z.string(),
+    turnId: z.string(),
   })
   .passthrough();
 
@@ -2018,6 +2031,7 @@ const CodexEventTurnDiffNotificationSchema = z
 
 type ParsedCodexNotification =
   | { kind: "thread_started"; threadId: string }
+  | { kind: "thread_compacted"; threadId: string; turnId: string }
   | { kind: "turn_started"; turnId: string; threadId: string | null }
   | {
       kind: "turn_completed";
@@ -2102,6 +2116,22 @@ const CodexNotificationSchema = z.union([
       }),
     ),
   z.object({ method: z.literal("thread/started"), params: z.unknown() }).transform(
+    ({ method, params }): ParsedCodexNotification => ({
+      kind: "invalid_payload",
+      method,
+      params,
+    }),
+  ),
+  z
+    .object({ method: z.literal("thread/compacted"), params: ThreadCompactedNotificationSchema })
+    .transform(
+      ({ params }): ParsedCodexNotification => ({
+        kind: "thread_compacted",
+        threadId: params.threadId,
+        turnId: params.turnId,
+      }),
+    ),
+  z.object({ method: z.literal("thread/compacted"), params: z.unknown() }).transform(
     ({ method, params }): ParsedCodexNotification => ({
       kind: "invalid_payload",
       method,
@@ -3589,7 +3619,13 @@ class CodexAppServerAgentSession implements AgentSession {
       appServerSkills.length === 0
         ? await listCodexSkills(this.config.cwd, this.deps.workspaceGitService)
         : [];
-    const builtin: AgentSlashCommand[] = [];
+    const builtin: AgentSlashCommand[] = [
+      {
+        name: "compact",
+        description: "Compact the current Codex thread",
+        argumentHint: "",
+      },
+    ];
     if (this.goalsEnabled) {
       builtin.push({
         name: "goal",
@@ -3605,10 +3641,24 @@ class CodexAppServerAgentSession implements AgentSession {
   tryHandleOutOfBand(
     prompt: AgentPromptInput,
   ): { run(ctx: { emit: (event: AgentStreamEvent) => void }): Promise<void> } | null {
-    if (!this.goalsEnabled) return null;
     if (typeof prompt !== "string") return null;
     const parsed = this.parseSlashCommandInput(prompt);
-    if (!parsed || parsed.commandName !== "goal") return null;
+    if (!parsed) return null;
+
+    if (parsed.commandName === "compact") {
+      return {
+        run: async ({ emit }) => {
+          await this.executeCompactCommand();
+          emit({
+            type: "timeline",
+            provider: CODEX_PROVIDER,
+            item: { type: "compaction", status: "loading", trigger: "manual" },
+          });
+        },
+      };
+    }
+
+    if (!this.goalsEnabled || parsed.commandName !== "goal") return null;
 
     const subcommand = parseGoalSubcommand(parsed.args);
     return {
@@ -3621,6 +3671,32 @@ class CodexAppServerAgentSession implements AgentSession {
         });
       },
     };
+  }
+
+  private async executeCompactCommand(): Promise<void> {
+    await this.connect();
+    if (this.currentThreadId) {
+      await this.ensureThreadLoaded();
+    } else {
+      await this.ensureThread();
+    }
+    if (!this.client || !this.currentThreadId) {
+      throw new Error("Codex thread is not available");
+    }
+    try {
+      await this.client.request("thread/compact/start", {
+        threadId: this.currentThreadId,
+      });
+    } catch (error) {
+      if (isIgnorableCompactStartError(error)) {
+        this.logger.warn(
+          { err: error, threadId: this.currentThreadId },
+          "Ignoring compact start error and waiting for compacted notification",
+        );
+        return;
+      }
+      throw error;
+    }
   }
 
   private async executeGoalSubcommand(subcommand: GoalSubcommand): Promise<string> {
@@ -3808,6 +3884,9 @@ class CodexAppServerAgentSession implements AgentSession {
     switch (parsed.kind) {
       case "thread_started":
         this.handleThreadStartedNotification(parsed);
+        return;
+      case "thread_compacted":
+        this.handleThreadCompactedNotification(parsed);
         return;
       case "turn_started":
         this.handleTurnStartedNotification(parsed);
@@ -4070,6 +4149,19 @@ class CodexAppServerAgentSession implements AgentSession {
       type: "thread_started",
       provider: CODEX_PROVIDER,
       sessionId: parsed.threadId,
+    });
+  }
+
+  private handleThreadCompactedNotification(
+    parsed: Extract<ParsedCodexNotification, { kind: "thread_compacted" }>,
+  ): void {
+    if (parsed.threadId !== this.currentThreadId) {
+      return;
+    }
+    this.emitEvent({
+      type: "timeline",
+      provider: CODEX_PROVIDER,
+      item: { type: "compaction", status: "completed" },
     });
   }
 
@@ -5053,6 +5145,17 @@ function resolveSkillDescription(skill: Record<string, unknown>): string {
   return "Skill";
 }
 
+function isIgnorableCompactStartError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  const message = error.message.toLowerCase();
+  return (
+    message.includes("error running remote compact task") &&
+    message.includes("timeout waiting for child process to exit")
+  );
+}
+
 export const __codexAppServerInternals = {
   buildCodexAppServerEnv,
   CodexAppServerClient,
@@ -5068,4 +5171,5 @@ export const __codexAppServerInternals = {
   normalizeCodexQuestionPrompts,
   toAgentUsage,
   threadItemToTimeline,
+  isIgnorableCompactStartError,
 };

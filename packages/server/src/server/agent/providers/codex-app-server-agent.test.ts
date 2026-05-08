@@ -932,6 +932,130 @@ describe("Codex app-server provider", () => {
     ]);
   });
 
+  test("lists /compact as a built-in Codex command", async () => {
+    const session = createSession();
+    session.client = {
+      request: vi.fn(async (method: string) => {
+        if (method === "skills/list") {
+          return { skills: [] };
+        }
+        return {};
+      }),
+    };
+
+    await expect(session.listCommands?.()).resolves.toContainEqual({
+      name: "compact",
+      description: "Compact the current Codex thread",
+      argumentHint: "",
+    });
+  });
+
+  test("handles /compact out-of-band without sending it as a prompt", async () => {
+    const requests: Array<{ method: string; params: unknown }> = [];
+    const session = createSession();
+    session.client = {
+      request: vi.fn(async (method: string, params: unknown) => {
+        requests.push({ method, params });
+        if (method === "thread/loaded/list") {
+          return { data: ["test-thread"] };
+        }
+        return {};
+      }),
+    };
+
+    const handler = session.tryHandleOutOfBand?.("/compact");
+    expect(handler).not.toBeNull();
+
+    const events: AgentStreamEvent[] = [];
+    await handler?.run({ emit: (event) => events.push(event) });
+
+    expect(requests).toContainEqual({
+      method: "thread/compact/start",
+      params: { threadId: "test-thread" },
+    });
+    expect(requests.some((request) => request.method === "turn/start")).toBe(false);
+    expect(events).toEqual([
+      {
+        type: "timeline",
+        provider: "codex",
+        item: {
+          type: "compaction",
+          status: "loading",
+          trigger: "manual",
+        },
+      },
+    ]);
+  });
+
+  test("suppresses known remote compact task child-exit timeouts", async () => {
+    const session = createSession();
+    session.client = {
+      request: vi.fn(async (method: string) => {
+        if (method === "thread/loaded/list") {
+          return { data: ["test-thread"] };
+        }
+        if (method === "thread/compact/start") {
+          throw new Error(
+            "Error running remote compact task: timeout waiting for child process to exit",
+          );
+        }
+        return {};
+      }),
+    };
+
+    const handler = session.tryHandleOutOfBand?.("/compact");
+    expect(handler).not.toBeNull();
+
+    const events: AgentStreamEvent[] = [];
+    await expect(handler?.run({ emit: (event) => events.push(event) })).resolves.toBeUndefined();
+
+    expect(events).toEqual([
+      {
+        type: "timeline",
+        provider: "codex",
+        item: {
+          type: "compaction",
+          status: "loading",
+          trigger: "manual",
+        },
+      },
+    ]);
+  });
+
+  test("maps Codex thread compacted notifications to completed compaction timeline items", () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    asInternals(session).handleNotification("thread/compacted", {
+      threadId: "test-thread",
+      turnId: "compact-turn",
+    });
+
+    expect(events).toEqual([
+      {
+        type: "timeline",
+        provider: "codex",
+        turnId: "test-turn",
+        item: {
+          type: "compaction",
+          status: "completed",
+        },
+      },
+    ]);
+  });
+
+  test("maps Codex compaction history items to completed compaction timeline items", () => {
+    expect(__codexAppServerInternals.threadItemToTimeline({ type: "ContextCompaction" })).toEqual({
+      type: "compaction",
+      status: "completed",
+    });
+    expect(__codexAppServerInternals.threadItemToTimeline({ type: "context_compaction" })).toEqual({
+      type: "compaction",
+      status: "completed",
+    });
+  });
+
   test("maps question responses from headers back to question ids and completes the tool call", async () => {
     const session = createSession();
     const events: AgentStreamEvent[] = [];
