@@ -259,6 +259,10 @@ interface ClaudeAgentSessionOptions {
 
 type ClaudeThinkingEffort = "low" | "medium" | "high" | "xhigh" | "max";
 
+function toClaudeSdkEffort(effort: ClaudeThinkingEffort): ClaudeOptions["effort"] {
+  return effort === "xhigh" ? "max" : effort;
+}
+
 function resolvePathEnvKey(): "Path" | "PATH" | null {
   if (process.env["Path"] !== undefined) return "Path";
   if (process.env["PATH"] !== undefined) return "PATH";
@@ -2196,7 +2200,7 @@ class ClaudeAgentSession implements AgentSession {
         ? this.config.thinkingOptionId
         : undefined;
     if (thinkingOptionId && isClaudeThinkingEffort(thinkingOptionId)) {
-      return { thinking: { type: "adaptive" }, effort: thinkingOptionId };
+      return { thinking: { type: "adaptive" }, effort: toClaudeSdkEffort(thinkingOptionId) };
     }
     return { thinking: undefined, effort: undefined };
   }
