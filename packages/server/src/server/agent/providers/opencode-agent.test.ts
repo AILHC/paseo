@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, test, vi } from "vitest";
-import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
@@ -76,6 +76,14 @@ async function collectTurnEvents(iterator: AsyncGenerator<AgentStreamEvent>): Pr
   }
 
   return result;
+}
+
+function createAsyncIterable<T>(items: T[]): AsyncIterable<T> {
+  return (async function* () {
+    for (const item of items) {
+      yield item;
+    }
+  })();
 }
 
 function isBinaryInstalled(binary: string): boolean {
@@ -566,6 +574,160 @@ describe("OpenCode adapter context-window normalization", () => {
 });
 
 describe("OpenCode adapter startTurn error handling", () => {
+  test("unwraps OpenCode global event payloads during a turn", async () => {
+    const globalEvents = [
+      {
+        payload: {
+          type: "server.connected",
+          properties: {},
+        },
+      },
+      {
+        directory: "/tmp/other",
+        payload: {
+          type: "message.part.delta",
+          properties: {
+            sessionID: "other-session",
+            messageID: "msg_other",
+            partID: "prt_other",
+            field: "text",
+            delta: "ignore me",
+          },
+        },
+      },
+      {
+        directory: "/tmp/test",
+        payload: {
+          type: "message.updated",
+          properties: {
+            info: {
+              id: "msg_assistant",
+              sessionID: "ses_unit_test",
+              role: "assistant",
+            },
+          },
+        },
+      },
+      {
+        directory: "/tmp/test",
+        payload: {
+          type: "message.part.delta",
+          properties: {
+            sessionID: "ses_unit_test",
+            messageID: "msg_assistant",
+            partID: "prt_text",
+            field: "text",
+            delta: "Hello from global",
+          },
+        },
+      },
+      {
+        directory: "/tmp/test",
+        payload: {
+          type: "session.status",
+          properties: {
+            sessionID: "ses_unit_test",
+            status: { type: "idle" },
+          },
+        },
+      },
+    ];
+    const fakeClient = {
+      event: {
+        subscribe: vi.fn(),
+      },
+      global: {
+        event: vi.fn().mockResolvedValue({ stream: createAsyncIterable(globalEvents) }),
+      },
+      session: {
+        promptAsync: vi.fn().mockResolvedValue({ data: {}, error: undefined }),
+      },
+    } as never;
+
+    const session = new __openCodeInternals.OpenCodeAgentSession(
+      { provider: "opencode", cwd: "/tmp/test" },
+      fakeClient,
+      "ses_unit_test",
+      createTestLogger(),
+      "/tmp/opencode-storage",
+    );
+
+    const turn = await collectTurnEvents(streamSession(session, "hello"));
+
+    expect(fakeClient.global.event).toHaveBeenCalledWith({
+      signal: expect.any(AbortSignal),
+      sseMaxRetryAttempts: 0,
+    });
+    expect(fakeClient.event.subscribe).not.toHaveBeenCalled();
+    expect(turn.turnCompleted).toBe(true);
+    expect(turn.turnFailed).toBe(false);
+    expect(turn.assistantMessages.map((message) => message.text).join("")).toBe(
+      "Hello from global",
+    );
+  });
+
+  test("fails a turn when OpenCode retry status does not recover", async () => {
+    vi.useFakeTimers();
+    const retryStream: AsyncIterable<unknown> = {
+      [Symbol.asyncIterator]: () => {
+        let emitted = false;
+        return {
+          next: async () => {
+            if (!emitted) {
+              emitted = true;
+              return {
+                done: false,
+                value: {
+                  payload: {
+                    type: "session.status",
+                    properties: {
+                      sessionID: "ses_unit_test",
+                      status: {
+                        type: "retry",
+                        attempt: 1,
+                        message: "model does not exist",
+                      },
+                    },
+                  },
+                },
+              };
+            }
+            return new Promise(() => {});
+          },
+        };
+      },
+    };
+    const fakeClient = {
+      global: {
+        event: vi.fn().mockResolvedValue({ stream: retryStream }),
+      },
+      session: {
+        promptAsync: vi.fn().mockResolvedValue({ data: {}, error: undefined }),
+      },
+    } as never;
+
+    const session = new __openCodeInternals.OpenCodeAgentSession(
+      { provider: "opencode", cwd: "/tmp/test" },
+      fakeClient,
+      "ses_unit_test",
+      createTestLogger(),
+      "/tmp/opencode-storage",
+    );
+
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    await session.startTurn("hello");
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    const failed = events.find((event) => event.type === "turn_failed");
+    expect(failed).toMatchObject({
+      type: "turn_failed",
+      error: expect.stringContaining("model does not exist"),
+    });
+    vi.useRealTimers();
+  });
+
   test("deletes provider session on close when persistence is disabled", async () => {
     const fakeClient = {
       session: {
@@ -580,6 +742,7 @@ describe("OpenCode adapter startTurn error handling", () => {
       fakeClient,
       "ses_unit_test",
       createTestLogger(),
+      "/tmp/opencode-storage",
       new Map(),
       undefined,
       false,
@@ -607,6 +770,7 @@ describe("OpenCode adapter startTurn error handling", () => {
       fakeClient,
       "ses_unit_test",
       createTestLogger(),
+      "/tmp/opencode-storage",
     );
 
     await session.close();
@@ -615,19 +779,29 @@ describe("OpenCode adapter startTurn error handling", () => {
   });
 
   test("emits turn_failed when client.session.promptAsync throws synchronously", async () => {
-    // Async iterable that never yields and never resolves. The IIFE in
-    // startTurn synchronously hits the promptAsync throw and finishes the
-    // turn before this iterator is ever pulled, so the never-resolving
-    // promise inside next() is fine and gets garbage-collected.
+    // Yield the server-connected event, then park forever. The adapter waits
+    // for that first event before sending the prompt.
     const neverYieldingStream: AsyncIterable<OpenCodeEvent> = {
-      [Symbol.asyncIterator]: () => ({
-        next: () => new Promise(() => {}),
-      }),
+      [Symbol.asyncIterator]: () => {
+        let emittedConnected = false;
+        return {
+          next: () => {
+            if (!emittedConnected) {
+              emittedConnected = true;
+              return Promise.resolve({
+                done: false,
+                value: { type: "server.connected", properties: {} } as OpenCodeEvent,
+              });
+            }
+            return new Promise(() => {});
+          },
+        };
+      },
     };
 
     const fakeClient = {
-      event: {
-        subscribe: vi.fn().mockResolvedValue({ stream: neverYieldingStream }),
+      global: {
+        event: vi.fn().mockResolvedValue({ stream: neverYieldingStream }),
       },
       session: {
         promptAsync: vi.fn(() => {
@@ -641,6 +815,7 @@ describe("OpenCode adapter startTurn error handling", () => {
       fakeClient,
       "ses_unit_test",
       createTestLogger(),
+      "/tmp/opencode-storage",
     );
 
     const events: AgentStreamEvent[] = [];
@@ -655,4 +830,182 @@ describe("OpenCode adapter startTurn error handling", () => {
       expect(failed.error).toContain("boom: synchronous throw");
     }
   });
+
+  test("delays the next prompt until a slow interrupt abort settles", async () => {
+    vi.useFakeTimers();
+    const abortDeferred = createTestDeferred<{ data: boolean; error: undefined }>();
+    const promptAsync = vi.fn().mockResolvedValue({ data: {}, error: undefined });
+    const abort = vi
+      .fn()
+      .mockReturnValueOnce(abortDeferred.promise)
+      .mockResolvedValue({ data: true, error: undefined });
+    const fakeClient = {
+      global: {
+        event: vi.fn().mockImplementation(
+          async (options: {
+            signal: AbortSignal;
+          }): Promise<{ stream: AsyncIterable<OpenCodeEvent> }> => ({
+            stream: abortableOpenCodeStream(options.signal),
+          }),
+        ),
+      },
+      session: {
+        promptAsync,
+        abort,
+      },
+    } as never;
+
+    const session = new __openCodeInternals.OpenCodeAgentSession(
+      { provider: "opencode", cwd: "/tmp/test" },
+      fakeClient,
+      "ses_unit_test",
+      createTestLogger(),
+      "/tmp/opencode-storage",
+    );
+
+    await session.startTurn("first");
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+
+    const interruptPromise = session.interrupt();
+    await vi.advanceTimersByTimeAsync(2_000);
+    await interruptPromise;
+    expect(abort).toHaveBeenCalledTimes(1);
+
+    const secondTurnPromise = session.startTurn("second");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+
+    abortDeferred.resolve({ data: true, error: undefined });
+    await secondTurnPromise;
+    expect(promptAsync).toHaveBeenCalledTimes(2);
+
+    await session.interrupt();
+    vi.useRealTimers();
+  });
 });
+
+describe("OpenCode persisted sessions", () => {
+  test("listPersistedAgents returns only sessions whose cwd matches the requested cwd", async () => {
+    const storageRoot = mkdtempSync(path.join(os.tmpdir(), "opencode-storage-"));
+    const cwd = path.join(storageRoot, "repo");
+    const otherCwd = path.join(storageRoot, "other");
+
+    writeOpenCodeJson(storageRoot, "session/project-1/ses_old.json", {
+      id: "ses_old",
+      directory: cwd,
+      title: "Old session",
+      time: { created: 1000, updated: 1000 },
+    });
+    writeOpenCodeJson(storageRoot, "session/project-1/ses_new.json", {
+      id: "ses_new",
+      directory: cwd,
+      title: "New session",
+      time: { created: 2000, updated: 3000 },
+    });
+    writeOpenCodeJson(storageRoot, "session/project-2/ses_other.json", {
+      id: "ses_other",
+      directory: otherCwd,
+      title: "Other cwd",
+      time: { created: 4000, updated: 4000 },
+    });
+    writeOpenCodeJson(storageRoot, "message/ses_new/msg_user.json", {
+      id: "msg_user",
+      sessionID: "ses_new",
+      role: "user",
+      time: { created: 2100 },
+    });
+    writeOpenCodeJson(storageRoot, "part/msg_user/prt_user.json", {
+      id: "prt_user",
+      sessionID: "ses_new",
+      messageID: "msg_user",
+      type: "text",
+      text: "hello world",
+      time: { start: 2100 },
+    });
+    writeOpenCodeJson(storageRoot, "message/ses_new/msg_assistant.json", {
+      id: "msg_assistant",
+      sessionID: "ses_new",
+      role: "assistant",
+      time: { created: 2200 },
+    });
+    writeOpenCodeJson(storageRoot, "part/msg_assistant/prt_assistant.json", {
+      id: "prt_assistant",
+      sessionID: "ses_new",
+      messageID: "msg_assistant",
+      type: "text",
+      text: "hello back",
+      time: { start: 2200 },
+    });
+
+    const client = new OpenCodeAgentClient(createTestLogger(), undefined, storageRoot);
+    const descriptors = await client.listPersistedAgents({ cwd, limit: 1 });
+
+    expect(descriptors).toHaveLength(1);
+    expect(descriptors[0]).toMatchObject({
+      provider: "opencode",
+      sessionId: "ses_new",
+      cwd,
+      title: "New session",
+      persistence: {
+        provider: "opencode",
+        sessionId: "ses_new",
+        nativeHandle: "ses_new",
+      },
+    });
+    expect(descriptors[0]?.lastActivityAt.toISOString()).toBe("1970-01-01T00:00:03.000Z");
+    expect(descriptors[0]?.timeline).toEqual([
+      { type: "user_message", text: "hello world", messageId: "msg_user" },
+      { type: "assistant_message", text: "hello back" },
+    ]);
+
+    rmSync(storageRoot, { recursive: true, force: true });
+  });
+});
+
+function writeOpenCodeJson(storageRoot: string, relativePath: string, value: unknown): void {
+  const filePath = path.join(storageRoot, relativePath);
+  mkdirSync(path.dirname(filePath), { recursive: true });
+  writeFileSync(filePath, JSON.stringify(value), "utf8");
+}
+
+function createTestDeferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (error: unknown) => void;
+} {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+function abortableOpenCodeStream(signal: AbortSignal): AsyncIterable<OpenCodeEvent> {
+  return {
+    [Symbol.asyncIterator]: () => {
+      let emittedConnected = false;
+      return {
+        next: () => {
+          if (!emittedConnected) {
+            emittedConnected = true;
+            return Promise.resolve({
+              done: false,
+              value: { type: "server.connected", properties: {} } as OpenCodeEvent,
+            });
+          }
+          return new Promise<IteratorResult<OpenCodeEvent>>((resolve) => {
+            if (signal.aborted) {
+              resolve({ done: true, value: undefined });
+              return;
+            }
+            signal.addEventListener("abort", () => resolve({ done: true, value: undefined }), {
+              once: true,
+            });
+          });
+        },
+      };
+    },
+  };
+}

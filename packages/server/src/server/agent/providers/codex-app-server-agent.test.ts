@@ -15,8 +15,13 @@ import type {
 } from "../agent-sdk-types.js";
 import {
   __codexAppServerInternals,
+  CodexAppServerAgentClient,
   codexAppServerTurnInputFromPrompt,
 } from "./codex-app-server-agent.js";
+import {
+  createFakeCodexAppServer,
+  waitForNextPermission,
+} from "./codex/test-utils/fake-app-server.js";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import { asInternals as castInternals, createStub } from "../../test-utils/class-mocks.js";
 
@@ -181,6 +186,60 @@ describe("Codex app-server provider", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  test("round-trips server-initiated command approvals through the real app-server transport", async () => {
+    const appServer = createFakeCodexAppServer({
+      initialize: () => ({}),
+      "collaborationMode/list": () => ({ data: [] }),
+      "skills/list": () => ({ data: [] }),
+    });
+    const session = new __codexAppServerInternals.CodexAppServerAgentSession(
+      createConfig({ cwd: "/workspace/project" }),
+      null,
+      createTestLogger(),
+      async () => appServer.child,
+    );
+
+    await session.connect();
+    appServer.assertNoErrors();
+
+    const permissionRequested = waitForNextPermission(session);
+    appServer.requestCommandApproval({
+      itemId: "exec-approval-1",
+      threadId: "thread-1",
+      turnId: "turn-1",
+      command: "git restore README.md",
+      cwd: "/workspace/project",
+      reason: "requires escalated permissions",
+    });
+
+    const permissionEvent = await permissionRequested;
+    expect(permissionEvent.request).toMatchObject({
+      id: "permission-exec-approval-1",
+      provider: "codex",
+      name: "CodexBash",
+      kind: "tool",
+      title: "Run command: git restore README.md",
+      description: "requires escalated permissions",
+      input: {
+        command: "git restore README.md",
+        cwd: "/workspace/project",
+      },
+      metadata: {
+        itemId: "exec-approval-1",
+        threadId: "thread-1",
+        turnId: "turn-1",
+      },
+    });
+
+    await session.respondToPermission(permissionEvent.request.id, { behavior: "allow" });
+
+    await expect(appServer.waitForCommandApprovalDecision("exec-approval-1")).resolves.toEqual({
+      decision: "accept",
+    });
+    appServer.assertNoErrors();
+    await session.close();
   });
 
   test("lists repo skills using WorkspaceGitService repo-root resolution", async () => {
@@ -840,6 +899,52 @@ describe("Codex app-server provider", () => {
         description: "Report findings.",
         log: "[Assistant] Found the path.",
         actions: [],
+      },
+    });
+  });
+
+  test("keeps the parent sub-agent running when a child command fails during the child turn", () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    asInternals(session).handleNotification("item/completed", {
+      threadId: "test-thread",
+      item: {
+        type: "collabAgentToolCall",
+        id: "call-sub-agent-child-command-failure",
+        tool: "spawnAgent",
+        status: "completed",
+        prompt: "Fix the regression test-first.",
+        receiverThreadIds: ["child-thread-1"],
+        agentsStates: {
+          "child-thread-1": { status: "running", message: null },
+        },
+      },
+    });
+    asInternals(session).handleNotification("item/completed", {
+      threadId: "child-thread-1",
+      item: {
+        type: "commandExecution",
+        id: "child-failing-command",
+        status: "failed",
+        command: "npx vitest run packages/server/src/server/agent/providers/opencode-agent.test.ts",
+        aggregatedOutput: "expected false to be true",
+        exitCode: 1,
+        error: { message: "Command failed" },
+      },
+    });
+
+    expect(events.at(-1)?.item).toMatchObject({
+      type: "tool_call",
+      callId: "call-sub-agent-child-command-failure",
+      name: "Sub-agent",
+      status: "running",
+      error: null,
+      detail: {
+        type: "sub_agent",
+        subAgentType: "Sub-agent",
+        description: "Fix the regression test-first.",
       },
     });
   });
@@ -1778,5 +1883,64 @@ describe("Codex app-server provider", () => {
         }),
       }),
     );
+  });
+});
+
+describe("Codex persisted sessions", () => {
+  test("listPersistedAgents returns only sessions whose cwd matches the requested cwd", async () => {
+    const allThreads = [
+      {
+        id: "thread-a1",
+        cwd: "/workspace/project-a",
+        preview: "First A session",
+        createdAt: 1000,
+        updatedAt: 2000,
+      },
+      {
+        id: "thread-a2",
+        cwd: "/workspace/project-a",
+        preview: "Second A session",
+        createdAt: 1500,
+        updatedAt: 2500,
+      },
+      {
+        id: "thread-b1",
+        cwd: "/workspace/project-b",
+        preview: "B session",
+        createdAt: 3000,
+        updatedAt: 4000,
+      },
+    ];
+
+    const fakeClient = {
+      request: async (method: string) => {
+        if (method === "thread/list") return { data: allThreads };
+        if (method === "thread/read") return { thread: { turns: [] } };
+        return {};
+      },
+      notify: () => {},
+      dispose: async () => {},
+    };
+
+    const provider = new CodexAppServerAgentClient(createTestLogger(), undefined, {
+      _createCodexClient: () => fakeClient,
+    });
+    castInternals<{ spawnAppServer: () => Promise<ChildProcessWithoutNullStreams> }>(
+      provider,
+    ).spawnAppServer = async () => {
+      const child = new EventEmitter() as ChildProcessWithoutNullStreams;
+      child.exitCode = 0;
+      child.signalCode = null;
+      child.stdin = new PassThrough();
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.kill = vi.fn(() => true) as ChildProcessWithoutNullStreams["kill"];
+      return child;
+    };
+
+    const descriptors = await provider.listPersistedAgents({ cwd: "/workspace/project-a" });
+
+    expect(descriptors.map((d) => d.sessionId).sort()).toEqual(["thread-a1", "thread-a2"]);
+    expect(descriptors.every((d) => d.cwd === "/workspace/project-a")).toBe(true);
   });
 });

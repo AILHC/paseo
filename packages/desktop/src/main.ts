@@ -23,6 +23,7 @@ import {
   setupWindowResizeEvents,
   setupDefaultContextMenu,
   setupDragDropPrevention,
+  buildStandardContextMenuItems,
 } from "./window/window-manager.js";
 import { registerDialogHandlers } from "./features/dialogs.js";
 import {
@@ -150,10 +151,7 @@ function showBrowserWebviewContextMenu(
   params: Electron.ContextMenuParams,
 ): void {
   const menu = Menu.buildFromTemplate([
-    { role: "copy", enabled: params.selectionText.length > 0 },
-    { role: "paste" },
-    { type: "separator" },
-    { role: "selectAll" },
+    ...buildStandardContextMenuItems(contents, params),
     ...(app.isPackaged
       ? []
       : [
@@ -193,6 +191,7 @@ if (forcedUserDataDir) {
     const topLevel = execFileSync("git", ["rev-parse", "--show-toplevel"], {
       encoding: "utf-8",
       timeout: 3000,
+      windowsHide: true,
     }).trim();
     devWorktreeName = path.basename(topLevel);
     // Main checkout (e.g. "paseo") gets default userData — only worktrees diverge.
@@ -202,6 +201,7 @@ if (forcedUserDataDir) {
         cwd: topLevel,
         encoding: "utf-8",
         timeout: 3000,
+        windowsHide: true,
       }).trim(),
     );
     const isWorktree = path.resolve(topLevel, ".git") !== commonDir;
