@@ -105,6 +105,7 @@ import {
   shutdownProviders,
 } from "./agent/provider-registry.js";
 import { bootstrapWorkspaceRegistries } from "./workspace-registry-bootstrap.js";
+import { WorkspaceReconciliationService } from "./workspace-reconciliation-service.js";
 import { FileBackedProjectRegistry, FileBackedWorkspaceRegistry } from "./workspace-registry.js";
 import { FileBackedChatService } from "./chat/chat-service.js";
 import { CheckoutDiffManager } from "./checkout-diff-manager.js";
@@ -113,6 +114,7 @@ import { ScheduleService } from "./schedule/service.js";
 import { DaemonConfigStore } from "./daemon-config-store.js";
 import { WorkspaceGitServiceImpl } from "./workspace-git-service.js";
 import { archivePersistedWorkspaceRecord } from "./workspace-archive-service.js";
+import { setupAutoArchiveOnMerge } from "./auto-archive-on-merge/index.js";
 import { wrapSessionMessage, type SessionOutboundMessage } from "./messages.js";
 import type { TerminalManager } from "../terminal/terminal-manager.js";
 import { createConfiguredTerminalManager } from "../terminal/terminal-manager-factory.js";
@@ -195,8 +197,14 @@ function summarizeAgentMcpDebugBody(body: unknown): Record<string, unknown> {
 export type PaseoOpenAIConfig = OpenAiSpeechProviderConfig;
 export type PaseoLocalSpeechConfig = LocalSpeechProviderConfig;
 
+export interface PaseoSpeechSttLanguages {
+  dictation: string;
+  voice: string;
+}
+
 export interface PaseoSpeechConfig {
   providers: RequestedSpeechProviders;
+  sttLanguages?: PaseoSpeechSttLanguages;
   local?: PaseoLocalSpeechConfig;
 }
 
@@ -221,6 +229,7 @@ export interface PaseoDaemonConfig {
   hostnames?: HostnamesConfig;
   mcpEnabled?: boolean;
   mcpInjectIntoAgents?: boolean;
+  autoArchiveAfterMerge?: boolean;
   staticDir: string;
   mcpDebug: boolean;
   isDev?: boolean;
@@ -230,6 +239,7 @@ export interface PaseoDaemonConfig {
   relayEndpoint?: string;
   relayPublicEndpoint?: string;
   relayUseTls?: boolean;
+  relayPublicUseTls?: boolean;
   appBaseUrl?: string;
   auth?: DaemonAuthConfig;
   openai?: PaseoOpenAIConfig;
@@ -279,6 +289,7 @@ export async function createPaseoDaemon(
           },
         ]),
       ),
+      autoArchiveAfterMerge: config.autoArchiveAfterMerge ?? false,
     },
     logger,
   );
@@ -290,7 +301,9 @@ export async function createPaseoDaemon(
   const staticDir = config.staticDir;
   const downloadTokenTtlMs = config.downloadTokenTtlMs ?? 60000;
 
-  const downloadTokenStore = new DownloadTokenStore({ ttlMs: downloadTokenTtlMs });
+  const downloadTokenStore = new DownloadTokenStore({
+    ttlMs: downloadTokenTtlMs,
+  });
 
   const listenTarget = parseListenString(config.listen);
 
@@ -522,6 +535,26 @@ export async function createPaseoDaemon(
     logger,
   });
   logger.info({ elapsed: elapsed() }, "Workspace registries bootstrapped");
+  const workspaceReconciliation = new WorkspaceReconciliationService({
+    projectRegistry,
+    workspaceRegistry,
+    logger,
+    workspaceGitService,
+  });
+  void (async () => {
+    try {
+      const result = await workspaceReconciliation.runOnce();
+      logger.info(
+        {
+          elapsed: elapsed(),
+          changeCount: result.changesApplied.length,
+        },
+        "Workspace registries reconciled",
+      );
+    } catch (error) {
+      logger.error({ err: error }, "Background workspace reconciliation failed");
+    }
+  })();
   await chatService.initialize();
   logger.info({ elapsed: elapsed() }, "Chat service initialized");
   const checkoutDiffManager = new CheckoutDiffManager({
@@ -554,52 +587,67 @@ export async function createPaseoDaemon(
     "Voice mode configured for agent-scoped resume flow (no dedicated voice assistant provider)",
   );
   logger.info({ elapsed: elapsed() }, "Preparing voice and MCP runtime");
+
+  const archiveWorkspaceRecordExternal = async (workspaceId: string) => {
+    const sessions = wsServer?.listActiveSessions() ?? [];
+    if (sessions.length > 0) {
+      await Promise.all(
+        sessions.map((session) => session.archiveWorkspaceRecordForExternalMutation(workspaceId)),
+      );
+      return;
+    }
+
+    await archivePersistedWorkspaceRecord({
+      workspaceId,
+      workspaceRegistry,
+      projectRegistry,
+    });
+  };
+  const markWorkspaceArchivingExternal = (workspaceIds: Iterable<string>, archivingAt: string) => {
+    const workspaceIdList = Array.from(workspaceIds);
+    for (const session of wsServer?.listActiveSessions() ?? []) {
+      session.markWorkspaceArchivingForExternalMutation(workspaceIdList, archivingAt);
+    }
+  };
+  const clearWorkspaceArchivingExternal = (workspaceIds: Iterable<string>) => {
+    const workspaceIdList = Array.from(workspaceIds);
+    for (const session of wsServer?.listActiveSessions() ?? []) {
+      session.clearWorkspaceArchivingForExternalMutation(workspaceIdList);
+    }
+  };
+  const emitWorkspaceUpdatesExternal = async (workspaceIds: Iterable<string>) => {
+    const workspaceIdList = Array.from(workspaceIds);
+    await Promise.all(
+      (wsServer?.listActiveSessions() ?? []).map((session) =>
+        session.emitWorkspaceUpdatesForExternalWorkspaceIds(workspaceIdList),
+      ),
+    );
+  };
+  const emitExternalSessionMessage = (message: SessionOutboundMessage) => {
+    wsServer?.broadcast(wrapSessionMessage(message));
+  };
+
+  setupAutoArchiveOnMerge({
+    paseoHome: config.paseoHome,
+    daemonConfigStore,
+    workspaceGitService,
+    github,
+    agentManager,
+    agentStorage,
+    terminalManager,
+    logger,
+    archiveWorkspaceRecord: archiveWorkspaceRecordExternal,
+    markWorkspaceArchiving: markWorkspaceArchivingExternal,
+    clearWorkspaceArchiving: clearWorkspaceArchivingExternal,
+    emitWorkspaceUpdatesForWorkspaceIds: emitWorkspaceUpdatesExternal,
+    emitSessionMessage: emitExternalSessionMessage,
+  });
+
   const mcpEnabled = config.mcpEnabled ?? true;
   let agentMcpBaseUrl: string | null = null;
   if (mcpEnabled) {
     const agentMcpRoute = "/mcp/agents";
     const agentMcpTransports: AgentMcpTransportMap = new Map();
-    const archiveWorkspaceRecordForMcp = async (workspaceId: string) => {
-      const sessions = wsServer?.listActiveSessions() ?? [];
-      if (sessions.length > 0) {
-        await Promise.all(
-          sessions.map((session) => session.archiveWorkspaceRecordForExternalMutation(workspaceId)),
-        );
-        return;
-      }
-
-      await archivePersistedWorkspaceRecord({
-        workspaceId,
-        workspaceRegistry,
-        projectRegistry,
-      });
-    };
-    const markWorkspaceArchivingForMcpArchive = (
-      workspaceIds: Iterable<string>,
-      archivingAt: string,
-    ) => {
-      const workspaceIdList = Array.from(workspaceIds);
-      for (const session of wsServer?.listActiveSessions() ?? []) {
-        session.markWorkspaceArchivingForExternalMutation(workspaceIdList, archivingAt);
-      }
-    };
-    const clearWorkspaceArchivingForMcpArchive = (workspaceIds: Iterable<string>) => {
-      const workspaceIdList = Array.from(workspaceIds);
-      for (const session of wsServer?.listActiveSessions() ?? []) {
-        session.clearWorkspaceArchivingForExternalMutation(workspaceIdList);
-      }
-    };
-    const emitWorkspaceUpdatesForMcpArchive = async (workspaceIds: Iterable<string>) => {
-      const workspaceIdList = Array.from(workspaceIds);
-      await Promise.all(
-        (wsServer?.listActiveSessions() ?? []).map((session) =>
-          session.emitWorkspaceUpdatesForExternalWorkspaceIds(workspaceIdList),
-        ),
-      );
-    };
-    const emitMcpArchiveSessionMessage = (message: SessionOutboundMessage) => {
-      wsServer?.broadcast(wrapSessionMessage(message));
-    };
 
     const createAgentMcpTransport = async (callerAgentId?: string) => {
       const agentMcpServer = await createAgentMcpServer({
@@ -611,11 +659,11 @@ export async function createPaseoDaemon(
         providerRegistry,
         github,
         workspaceGitService,
-        archiveWorkspaceRecord: archiveWorkspaceRecordForMcp,
-        emitWorkspaceUpdatesForWorkspaceIds: emitWorkspaceUpdatesForMcpArchive,
-        markWorkspaceArchiving: markWorkspaceArchivingForMcpArchive,
-        clearWorkspaceArchiving: clearWorkspaceArchivingForMcpArchive,
-        emitSessionMessage: emitMcpArchiveSessionMessage,
+        archiveWorkspaceRecord: archiveWorkspaceRecordExternal,
+        emitWorkspaceUpdatesForWorkspaceIds: emitWorkspaceUpdatesExternal,
+        markWorkspaceArchiving: markWorkspaceArchivingExternal,
+        clearWorkspaceArchiving: clearWorkspaceArchivingExternal,
+        emitSessionMessage: emitExternalSessionMessage,
         createPaseoWorktree: async (input, serviceOptions) => {
           return createPaseoWorktreeWorkflow(
             {
@@ -649,10 +697,10 @@ export async function createPaseoDaemon(
                 void emitOptions;
               },
               cacheWorkspaceSetupSnapshot: () => {},
-              emit: emitMcpArchiveSessionMessage,
+              emit: emitExternalSessionMessage,
               sessionLogger: logger,
               terminalManager,
-              archiveWorkspaceRecord: archiveWorkspaceRecordForMcp,
+              archiveWorkspaceRecord: archiveWorkspaceRecordExternal,
               scriptRouteStore,
               scriptRuntimeStore,
               getDaemonTcpPort: () =>
@@ -818,6 +866,7 @@ export async function createPaseoDaemon(
           const relayEndpoint = config.relayEndpoint ?? "relay.paseo.sh:443";
           const relayPublicEndpoint = config.relayPublicEndpoint ?? relayEndpoint;
           const relayUseTls = config.relayUseTls ?? relayEndpoint === "relay.paseo.sh:443";
+          const relayPublicUseTls = config.relayPublicUseTls ?? relayUseTls;
           const appBaseUrl = config.appBaseUrl ?? "https://app.paseo.sh";
 
           if (boundListenTarget.type === "tcp") {
@@ -893,7 +942,10 @@ export async function createPaseoDaemon(
             const offer = await createConnectionOfferV2({
               serverId,
               daemonPublicKeyB64: daemonKeyPair.publicKeyB64,
-              relay: { endpoint: relayPublicEndpoint, useTls: relayUseTls },
+              relay: {
+                endpoint: relayPublicEndpoint,
+                useTls: relayPublicUseTls,
+              },
             });
 
             encodeOfferToFragmentUrl({ offer, appBaseUrl });

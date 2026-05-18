@@ -12,6 +12,11 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  # CI does not use the CUDA execution provider, and the onnxruntime-node
+  # postinstall download from NuGet is large enough to make npm ci flaky.
+  ONNXRUNTIME_NODE_INSTALL: skip
+
 jobs:
   format:
     runs-on: ubuntu-latest
@@ -99,8 +104,8 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Install Claude Code CLI for provider tests
-        run: npm install -g @anthropic-ai/claude-code
+      - name: Install agent CLIs for provider tests
+        run: npm install -g @anthropic-ai/claude-code opencode-ai
 
       - name: Build highlight dependency
         run: npm run build --workspace=@getpaseo/highlight
@@ -113,6 +118,7 @@ jobs:
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 
   desktop-tests:
     strategy:

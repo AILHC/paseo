@@ -75,6 +75,7 @@ export interface AgentRuntimeInfo {
   sessionId: string | null;
   model?: string | null;
   modeId?: string | null;
+  thinkingOptionId?: string | null;
   extra?: Record<string, unknown>;
 }
 
@@ -113,6 +114,7 @@ export interface WorkspaceDescriptor {
   id: string;
   projectId: string;
   projectDisplayName: string;
+  projectCustomName?: string | null;
   projectRootPath: string;
   workspaceDirectory: string;
   projectKind: WorkspaceDescriptorPayload["projectKind"];
@@ -134,6 +136,7 @@ export function normalizeWorkspaceDescriptor(
     id: normalizeWorkspaceOpaqueId(payload.id) ?? payload.id,
     projectId: payload.projectId,
     projectDisplayName: payload.projectDisplayName,
+    projectCustomName: payload.projectCustomName ?? null,
     projectRootPath: payload.projectRootPath,
     workspaceDirectory: payload.workspaceDirectory,
     projectKind: payload.projectKind,

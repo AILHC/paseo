@@ -29,7 +29,7 @@ import {
   mapTaskNotificationSystemRecordToToolCall,
   mapTaskNotificationUserContentToToolCall,
 } from "./task-notification-tool-call.js";
-import { getClaudeModels, normalizeClaudeRuntimeModelId } from "./models.js";
+import { getClaudeModelsWithSettings, normalizeClaudeRuntimeModelId } from "./models.js";
 import { parsePartialJsonObject } from "./partial-json.js";
 import { ClaudeSidechainTracker } from "./sidechain-tracker.js";
 import {
@@ -41,35 +41,37 @@ import {
 import { appendOrReplaceGrowingAssistantMessage, runProviderTurn } from "../provider-runner.js";
 import { renderPromptAttachmentAsText } from "../../prompt-attachments.js";
 import { claudeQuery, type ClaudeOptions, type ClaudeQueryFactory } from "./query.js";
+import { normalizeProviderReplayTimestamp } from "../../provider-history-timestamps.js";
 
-import type {
-  AgentPermissionAction,
-  AgentCapabilityFlags,
-  AgentClient,
-  AgentCreateSessionOptions,
-  AgentLaunchContext,
-  AgentMetadata,
-  AgentMode,
-  AgentModelDefinition,
-  AgentPermissionRequest,
-  AgentPermissionRequestKind,
-  AgentPermissionResponse,
-  AgentPermissionUpdate,
-  AgentPersistenceHandle,
-  AgentPromptInput,
-  AgentRunOptions,
-  AgentRunResult,
-  AgentSession,
-  AgentSessionConfig,
-  AgentSlashCommand,
-  AgentStreamEvent,
-  AgentTimelineItem,
-  AgentUsage,
-  AgentRuntimeInfo,
-  ListModelsOptions,
-  ListPersistedAgentsOptions,
-  McpServerConfig,
-  PersistedAgentDescriptor,
+import {
+  getAgentStreamEventTurnId,
+  type AgentPermissionAction,
+  type AgentCapabilityFlags,
+  type AgentClient,
+  type AgentCreateSessionOptions,
+  type AgentLaunchContext,
+  type AgentMetadata,
+  type AgentMode,
+  type AgentModelDefinition,
+  type AgentPermissionRequest,
+  type AgentPermissionRequestKind,
+  type AgentPermissionResponse,
+  type AgentPermissionUpdate,
+  type AgentPersistenceHandle,
+  type AgentPromptInput,
+  type AgentRunOptions,
+  type AgentRunResult,
+  type AgentSession,
+  type AgentSessionConfig,
+  type AgentSlashCommand,
+  type AgentStreamEvent,
+  type AgentTimelineItem,
+  type AgentUsage,
+  type AgentRuntimeInfo,
+  type ListModelsOptions,
+  type ListPersistedAgentsOptions,
+  type McpServerConfig,
+  type PersistedAgentDescriptor,
 } from "../../agent-sdk-types.js";
 import {
   createProviderEnv,
@@ -82,7 +84,11 @@ import { execCommand } from "../../../../utils/spawn.js";
 import { getOrchestratorModeInstructions } from "../../orchestrator-instructions.js";
 
 const fsPromises = promises;
-const CLAUDE_SETTING_SOURCES: NonNullable<ClaudeOptions["settingSources"]> = ["user", "project"];
+const CLAUDE_SETTING_SOURCES: NonNullable<ClaudeOptions["settingSources"]> = [
+  "user",
+  "project",
+  "local",
+];
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
@@ -180,6 +186,11 @@ interface AsyncMessageInput<T> {
   iterable: AsyncIterable<T>;
 }
 
+interface PersistedTimelineEntry {
+  item: AgentTimelineItem;
+  timestamp?: string;
+}
+
 const CLAUDE_CAPABILITIES: AgentCapabilityFlags = {
   supportsStreaming: true,
   supportsSessionPersistence: true,
@@ -194,6 +205,11 @@ const DEFAULT_MODES: AgentMode[] = [
     id: "default",
     label: "Always Ask",
     description: "Prompts for permission the first time a tool is used",
+  },
+  {
+    id: "auto",
+    label: "Auto mode",
+    description: "Uses a model classifier to review permission prompts automatically",
   },
   {
     id: "acceptEdits",
@@ -250,6 +266,7 @@ interface ClaudeAgentSessionOptions {
   defaults?: { agents?: Record<string, AgentDefinition> };
   runtimeSettings?: ProviderRuntimeSettings;
   handle?: AgentPersistenceHandle;
+  agentId?: string;
   launchEnv?: Record<string, string>;
   persistSession?: boolean;
   logger: Logger;
@@ -660,6 +677,41 @@ function isMcpServersRecord(value: unknown): value is Record<string, McpServerCo
 
 function isPermissionMode(value: string | undefined): value is PermissionMode {
   return typeof value === "string" && VALID_CLAUDE_MODES.has(value);
+}
+
+function isTruthyEnvValue(value: string | undefined): boolean {
+  const normalized = value?.trim().toLowerCase();
+  return (
+    normalized !== undefined &&
+    normalized.length > 0 &&
+    normalized !== "0" &&
+    normalized !== "false" &&
+    normalized !== "no" &&
+    normalized !== "off"
+  );
+}
+
+function detectIneligibleAutoModeTransport(env: NodeJS.ProcessEnv): "Bedrock" | "Vertex" | null {
+  if (isTruthyEnvValue(env.CLAUDE_CODE_USE_BEDROCK)) {
+    return "Bedrock";
+  }
+  if (isTruthyEnvValue(env.CLAUDE_CODE_USE_VERTEX)) {
+    return "Vertex";
+  }
+  return null;
+}
+
+function assertClaudeAutoModeEligible(mode: PermissionMode, env: NodeJS.ProcessEnv): void {
+  if (mode !== "auto") {
+    return;
+  }
+  const transport = detectIneligibleAutoModeTransport(env);
+  if (transport === null) {
+    return;
+  }
+  throw new Error(
+    `Claude Auto mode requires the Anthropic API and is not supported when Claude Code uses ${transport}. Select another permission mode or unset the ${transport === "Bedrock" ? "CLAUDE_CODE_USE_BEDROCK" : "CLAUDE_CODE_USE_VERTEX"} environment variable.`,
+  );
 }
 
 function coerceSessionMetadata(metadata: AgentMetadata | undefined): Partial<AgentSessionConfig> {
@@ -1156,8 +1208,6 @@ export function readEventIdentifiers(message: SDKMessage): EventIdentifiers {
   };
 }
 
-const claudeDebug = process.env.PASEO_CLAUDE_DEBUG === "1";
-
 export class ClaudeAgentClient implements AgentClient {
   readonly provider = "claude" as const;
   readonly capabilities = CLAUDE_CAPABILITIES;
@@ -1185,6 +1235,7 @@ export class ClaudeAgentClient implements AgentClient {
     return new ClaudeAgentSession(claudeConfig, {
       defaults: this.defaults,
       runtimeSettings: this.runtimeSettings,
+      agentId: launchContext?.agentId,
       launchEnv: launchContext?.env,
       persistSession: options?.persistSession,
       logger: this.logger,
@@ -1213,6 +1264,7 @@ export class ClaudeAgentClient implements AgentClient {
       defaults: this.defaults,
       runtimeSettings: this.runtimeSettings,
       handle,
+      agentId: launchContext?.agentId,
       launchEnv: launchContext?.env,
       logger: this.logger,
       queryFactory: this.queryFactory,
@@ -1221,8 +1273,8 @@ export class ClaudeAgentClient implements AgentClient {
   }
 
   async listModels(_options: ListModelsOptions): Promise<AgentModelDefinition[]> {
-    // Claude exposes a static catalog here; cwd/force are intentionally irrelevant.
-    return getClaudeModels();
+    // Claude exposes a global catalog here; cwd/force are intentionally irrelevant.
+    return await getClaudeModelsWithSettings(this.logger);
   }
 
   async listPersistedAgents(
@@ -1481,6 +1533,7 @@ class ClaudeAgentSession implements AgentSession {
 
   private readonly config: ClaudeAgentConfig;
   private readonly launchEnv?: Record<string, string>;
+  private readonly agentId?: string;
   private readonly defaults?: { agents?: Record<string, AgentDefinition> };
   private readonly runtimeSettings?: ProviderRuntimeSettings;
   private readonly persistSession?: boolean;
@@ -1505,7 +1558,7 @@ class ClaudeAgentSession implements AgentSession {
   private readonly sidechainTracker = new ClaudeSidechainTracker({
     getToolInput: (toolUseId) => this.toolUseCache.get(toolUseId)?.input ?? null,
   });
-  private persistedHistory: AgentTimelineItem[] = [];
+  private persistedHistory: PersistedTimelineEntry[] = [];
   private historyPending = false;
   private turnState: TurnState = "idle";
   private nextTurnOrdinal = 1;
@@ -1530,10 +1583,11 @@ class ClaudeAgentSession implements AgentSession {
   constructor(config: ClaudeAgentConfig, options: ClaudeAgentSessionOptions) {
     this.config = config;
     this.launchEnv = options.launchEnv;
+    this.agentId = options.agentId;
     this.defaults = options.defaults;
     this.runtimeSettings = options.runtimeSettings;
     this.persistSession = options.persistSession;
-    this.logger = options.logger;
+    this.logger = options.logger.child({ agentId: this.agentId });
     this.queryFactory = options.queryFactory;
     this.resolveBinary = options.resolveBinary;
     const handle = options.handle;
@@ -1712,8 +1766,13 @@ class ClaudeAgentSession implements AgentSession {
     const history = this.persistedHistory;
     this.persistedHistory = [];
     this.historyPending = false;
-    for (const item of history) {
-      yield { type: "timeline", item, provider: "claude" };
+    for (const entry of history) {
+      yield {
+        type: "timeline",
+        item: entry.item,
+        provider: "claude",
+        timestamp: entry.timestamp,
+      };
     }
   }
 
@@ -1735,6 +1794,7 @@ class ClaudeAgentSession implements AgentSession {
     }
 
     const normalized = isPermissionMode(modeId) ? modeId : "default";
+    assertClaudeAutoModeEligible(normalized, this.buildSdkEnv(this.config.extra?.claude));
     const previousMode = this.currentMode;
     const activeQuery = await this.ensureQuery();
     await activeQuery.setPermissionMode(normalized);
@@ -1873,13 +1933,16 @@ class ClaudeAgentSession implements AgentSession {
   async close(): Promise<void> {
     this.logger.trace(
       {
-        claudeSessionId: this.claudeSessionId,
+        agentId: this.agentId,
+        provider: "claude",
+        sessionId: this.claudeSessionId,
+        turnId: this.activeForegroundTurnId ?? this.autonomousTurn?.id ?? undefined,
         turnState: this.turnState,
         hasQuery: Boolean(this.query),
         hasInput: Boolean(this.input),
         hasActiveForegroundTurnId: Boolean(this.activeForegroundTurnId),
       },
-      "Claude session close: start",
+      "provider.claude.session_close.start",
     );
     this.closed = true;
     this.rejectAllPendingPermissions(new Error("Claude session closed"));
@@ -1914,8 +1977,13 @@ class ClaudeAgentSession implements AgentSession {
       }
     }
     this.logger.trace(
-      { claudeSessionId: this.claudeSessionId, turnState: this.turnState },
-      "Claude session close: completed",
+      {
+        agentId: this.agentId,
+        provider: "claude",
+        sessionId: this.claudeSessionId,
+        turnState: this.turnState,
+      },
+      "provider.claude.session_close.complete",
     );
   }
 
@@ -2089,9 +2157,9 @@ class ClaudeAgentSession implements AgentSession {
       pushUnique(historyIds[idx]);
     }
     for (let idx = this.persistedHistory.length - 1; idx >= 0; idx -= 1) {
-      const item = this.persistedHistory[idx];
-      if (item?.type === "user_message") {
-        pushUnique(item.messageId);
+      const entry = this.persistedHistory[idx];
+      if (entry?.item.type === "user_message") {
+        pushUnique(entry.item.messageId);
       }
     }
     for (let idx = this.userMessageIds.length - 1; idx >= 0; idx -= 1) {
@@ -2192,16 +2260,41 @@ class ClaudeAgentSession implements AgentSession {
     label: string,
   ): Promise<void> {
     if (!promise) {
-      this.logger.trace({ label }, "Claude query operation skipped (no promise)");
+      this.logger.trace(
+        {
+          agentId: this.agentId,
+          provider: "claude",
+          sessionId: this.claudeSessionId,
+          turnId: this.activeForegroundTurnId ?? this.autonomousTurn?.id ?? undefined,
+          label,
+        },
+        "provider.claude.query_operation.skip",
+      );
       return;
     }
     const startedAt = Date.now();
-    this.logger.trace({ label }, "Claude query operation wait start");
+    this.logger.trace(
+      {
+        agentId: this.agentId,
+        provider: "claude",
+        sessionId: this.claudeSessionId,
+        turnId: this.activeForegroundTurnId ?? this.autonomousTurn?.id ?? undefined,
+        label,
+      },
+      "provider.claude.query_operation.start",
+    );
     try {
       await withTimeout(promise, 3_000, "timeout");
       this.logger.trace(
-        { label, durationMs: Date.now() - startedAt },
-        "Claude query operation settled",
+        {
+          agentId: this.agentId,
+          provider: "claude",
+          sessionId: this.claudeSessionId,
+          turnId: this.activeForegroundTurnId ?? this.autonomousTurn?.id ?? undefined,
+          label,
+          durationMs: Date.now() - startedAt,
+        },
+        "provider.claude.query_operation.settled",
       );
     } catch (error) {
       this.logger.warn({ err: error, label }, "Claude query operation did not settle cleanly");
@@ -2228,11 +2321,8 @@ class ClaudeAgentSession implements AgentSession {
       .join("\n\n");
   }
 
-  private async buildOptions(): Promise<ClaudeOptions> {
-    const { thinking, effort } = this.resolveThinkingConfig();
-    const appendedSystemPrompt = this.buildAppendedSystemPrompt();
-    const extraClaudeOptions = this.config.extra?.claude;
-    const sdkEnv = createProviderEnv({
+  private buildSdkEnv(extraClaudeOptions: Partial<ClaudeOptions> | undefined): NodeJS.ProcessEnv {
+    return createProviderEnv({
       baseEnv: process.env,
       runtimeSettings: this.runtimeSettings,
       overlays: [
@@ -2245,6 +2335,14 @@ class ClaudeAgentSession implements AgentSession {
         this.launchEnv,
       ],
     });
+  }
+
+  private async buildOptions(): Promise<ClaudeOptions> {
+    const { thinking, effort } = this.resolveThinkingConfig();
+    const appendedSystemPrompt = this.buildAppendedSystemPrompt();
+    const extraClaudeOptions = this.config.extra?.claude;
+    const sdkEnv = this.buildSdkEnv(extraClaudeOptions);
+    assertClaudeAutoModeEligible(this.currentMode, sdkEnv);
 
     const claudeBinary = await this.resolveBinary();
     this.logger.debug(
@@ -2597,7 +2695,16 @@ class ClaudeAgentSession implements AgentSession {
     }
 
     const pump = this.runQueryPump().catch((error) => {
-      this.logger.trace({ err: error }, "Claude query pump exited unexpectedly");
+      this.logger.trace(
+        {
+          agentId: this.agentId,
+          provider: "claude",
+          sessionId: this.claudeSessionId,
+          turnId: this.activeForegroundTurnId ?? this.autonomousTurn?.id ?? undefined,
+          err: error,
+        },
+        "provider.claude.query_pump.exit_unexpected",
+      );
     });
 
     this.queryPumpPromise = pump;
@@ -2613,24 +2720,34 @@ class ClaudeAgentSession implements AgentSession {
     try {
       activeQuery = await this.ensureQuery();
     } catch (error) {
-      this.logger.trace({ err: error }, "Failed to initialize Claude query pump");
+      this.logger.trace(
+        {
+          agentId: this.agentId,
+          provider: "claude",
+          sessionId: this.claudeSessionId,
+          turnId: this.activeForegroundTurnId ?? this.autonomousTurn?.id ?? undefined,
+          err: error,
+        },
+        "provider.claude.query_pump.init_failed",
+      );
       this.failActiveTurns(error instanceof Error ? error.message : "Claude stream failed");
       return;
     }
 
     let consecutiveInterruptAbortRecoveries = 0;
     const logRawMessage = (message: SDKMessage): void => {
-      if (!claudeDebug) {
-        return;
-      }
       this.logger.trace(
         {
-          claudeSessionId: this.claudeSessionId,
+          agentId: this.agentId,
+          provider: "claude",
+          sessionId: this.claudeSessionId,
+          turnId: this.activeForegroundTurnId ?? this.autonomousTurn?.id ?? undefined,
           messageType: message.type,
           messageSubtype: "subtype" in message ? message.subtype : undefined,
           messageUuid: "uuid" in message ? message.uuid : undefined,
+          rawEvent: message,
         },
-        "Claude query pump: raw SDK message",
+        "provider.claude.raw_event",
       );
     };
     const handlePumpedMessage = async (message: SDKMessage): Promise<boolean> => {
@@ -2743,16 +2860,18 @@ class ClaudeAgentSession implements AgentSession {
     const turnId = this.activeForegroundTurnId ?? this.autonomousTurn?.id ?? null;
     const identifiers = readEventIdentifiers(message);
 
-    if (claudeDebug) {
-      this.logger.trace(
-        {
-          claudeSessionId: this.claudeSessionId,
-          messageType: message.type,
-          turnId,
-        },
-        "Claude query pump: SDK message",
-      );
-    }
+    this.logger.trace(
+      {
+        agentId: this.agentId,
+        provider: "claude",
+        sessionId: this.claudeSessionId,
+        turnId: turnId ?? undefined,
+        messageType: message.type,
+        identifiers,
+        rawEvent: message,
+      },
+      "provider.claude.parsed_event",
+    );
 
     const messageEvents = this.translateMessageToEvents(message, {
       suppressAssistantText: true,
@@ -2820,7 +2939,6 @@ class ClaudeAgentSession implements AgentSession {
 
     this.logger.warn(
       {
-        claudeSessionId: this.claudeSessionId,
         error: staleResumeError,
       },
       "Claude resumed session no longer exists; invalidating persisted session",
@@ -2850,7 +2968,15 @@ class ClaudeAgentSession implements AgentSession {
   private async interruptActiveTurn(): Promise<void> {
     const queryToInterrupt = this.query;
     if (!queryToInterrupt || typeof queryToInterrupt.interrupt !== "function") {
-      this.logger.trace("interruptActiveTurn: no query to interrupt");
+      this.logger.trace(
+        {
+          agentId: this.agentId,
+          provider: "claude",
+          sessionId: this.claudeSessionId,
+          turnId: this.activeForegroundTurnId ?? this.autonomousTurn?.id ?? undefined,
+        },
+        "provider.claude.interrupt.no_query",
+      );
       return;
     }
     this.pendingInterruptAbort = true;
@@ -2975,29 +3101,7 @@ class ClaudeAgentSession implements AgentSession {
       return;
     }
     if (message.subtype === "task_notification") {
-      // TODO: subagent timelines are best-effort. Subagent task_notifications
-      // arrive without parent_tool_use_id but with tool_use_id pointing at the
-      // parent's Task call, so they slip past the sidechain router and pollute
-      // the parent timeline. Drop them here; eventually thread them into the
-      // parent Task tool call's sub_agent log instead.
-      const taskUseId = message.tool_use_id;
-      const cachedTool = taskUseId ? this.toolUseCache.get(taskUseId) : undefined;
-      if (cachedTool?.name === "Task") {
-        return;
-      }
-      const taskNotificationItem = mapTaskNotificationSystemRecordToToolCall(message);
-      if (taskNotificationItem) {
-        events.push({
-          type: "timeline",
-          item: taskNotificationItem,
-          provider: "claude",
-        });
-      }
-      const usage = readUsageFromTaskNotification(message);
-      if (typeof usage === "number") {
-        this.lastContextWindowUsedTokens = usage;
-        events.push(this.createUsageUpdatedEvent(usage));
-      }
+      this.appendTaskNotificationEvents(message, events);
       return;
     }
     if (message.subtype === "task_progress") {
@@ -3006,6 +3110,35 @@ class ClaudeAgentSession implements AgentSession {
       if (typeof this.lastContextWindowUsedTokens === "number") {
         events.push(this.createUsageUpdatedEvent(this.lastContextWindowUsedTokens));
       }
+    }
+  }
+
+  private appendTaskNotificationEvents(
+    message: Extract<SDKMessage, { type: "system"; subtype: "task_notification" }>,
+    events: AgentStreamEvent[],
+  ): void {
+    // TODO: subagent timelines are best-effort. Subagent task_notifications
+    // arrive without parent_tool_use_id but with tool_use_id pointing at the
+    // parent's Task call, so they slip past the sidechain router and pollute
+    // the parent timeline. Drop them here; eventually thread them into the
+    // parent Task tool call's sub_agent log instead.
+    const taskUseId = message.tool_use_id;
+    const cachedTool = taskUseId ? this.toolUseCache.get(taskUseId) : undefined;
+    if (cachedTool?.name === "Task") {
+      return;
+    }
+    const taskNotificationItem = mapTaskNotificationSystemRecordToToolCall(message);
+    if (taskNotificationItem) {
+      events.push({
+        type: "timeline",
+        item: taskNotificationItem,
+        provider: "claude",
+      });
+    }
+    const usage = readUsageFromTaskNotification(message);
+    if (typeof usage === "number") {
+      this.lastContextWindowUsedTokens = usage;
+      events.push(this.createUsageUpdatedEvent(usage));
     }
   }
 
@@ -3100,6 +3233,24 @@ class ClaudeAgentSession implements AgentSession {
   ): void {
     const usage = this.convertUsage(message, message.modelUsage);
     if (message.subtype === "success") {
+      // Built-in slash commands (e.g. /voice, /usage, "Unknown command: …")
+      // run client-side in the Claude CLI with no model turn — output_tokens
+      // is 0 and the user-visible text is carried in `result`. Surface it as
+      // an assistant message so the turn doesn't end silently. Normal turns
+      // have output_tokens > 0 and their text is already in the stream.
+      const resultText = typeof message.result === "string" ? message.result.trim() : "";
+      const outputTokens = message.usage?.output_tokens;
+      if (resultText.length > 0 && outputTokens === 0) {
+        events.push({
+          type: "timeline",
+          provider: "claude",
+          item: {
+            type: "assistant_message",
+            text: resultText,
+            messageId: message.uuid,
+          },
+        });
+      }
       events.push({ type: "turn_completed", provider: "claude", usage });
       return;
     }
@@ -3459,6 +3610,16 @@ class ClaudeAgentSession implements AgentSession {
   private notifySubscribers(event: AgentStreamEvent): void {
     const turnId = this.activeForegroundTurnId ?? this.autonomousTurn?.id;
     const tagged = turnId ? { ...event, turnId } : event;
+    this.logger.trace(
+      {
+        agentId: this.agentId,
+        provider: "claude",
+        sessionId: this.claudeSessionId,
+        turnId: getAgentStreamEventTurnId(tagged),
+        event: tagged,
+      },
+      "provider.claude.event_emit",
+    );
     for (const callback of this.subscribers) {
       try {
         callback(tagged);
@@ -3503,7 +3664,7 @@ class ClaudeAgentSession implements AgentSession {
       return;
     }
 
-    const timeline: AgentTimelineItem[] = [];
+    const timeline: PersistedTimelineEntry[] = [];
     for (const line of content.split(/\r?\n/)) {
       this.ingestPersistedHistoryLine(line, timeline);
     }
@@ -3514,7 +3675,7 @@ class ClaudeAgentSession implements AgentSession {
     }
   }
 
-  private ingestPersistedHistoryLine(line: string, timeline: AgentTimelineItem[]): void {
+  private ingestPersistedHistoryLine(line: string, timeline: PersistedTimelineEntry[]): void {
     const trimmed = line.trim();
     if (!trimmed) {
       return;
@@ -3539,9 +3700,15 @@ class ClaudeAgentSession implements AgentSession {
       this.rememberUserMessageId(entry.uuid);
     }
 
+    const historyTimestamp = normalizeProviderReplayTimestamp(entry.timestamp);
     const items = this.convertHistoryEntry(entry);
     if (items.length > 0) {
-      timeline.push(...items);
+      timeline.push(
+        ...items.map((item) => ({
+          item,
+          timestamp: historyTimestamp ?? undefined,
+        })),
+      );
     }
   }
 

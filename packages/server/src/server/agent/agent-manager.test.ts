@@ -716,6 +716,7 @@ test("createAgent passes daemon launch env through the provider launch context",
     modeId: "auto",
   });
   expect(client.lastLaunchContext).toEqual({
+    agentId: snapshot.id,
     env: {
       PASEO_AGENT_ID: snapshot.id,
     },
@@ -1179,6 +1180,7 @@ test("resumeAgentFromPersistence keeps metadata config, applies overrides, and p
     },
   });
   expect(client.lastResumeLaunchContext).toEqual({
+    agentId: resumed.id,
     env: {
       PASEO_AGENT_ID: resumed.id,
     },
@@ -1205,9 +1207,11 @@ test("findPersistedAgent returns matching descriptors by session id or native ha
 
   class PersistedAgentsClient extends TestAgentClient {
     lastLimit: number | undefined;
+    lastCwd: string | undefined;
 
-    override async listPersistedAgents(options?: { limit?: number }) {
+    override async listPersistedAgents(options?: { limit?: number; cwd?: string }) {
       this.lastLimit = options?.limit;
+      this.lastCwd = options?.cwd;
       return descriptors;
     }
   }
@@ -1224,7 +1228,11 @@ test("findPersistedAgent returns matching descriptors by session id or native ha
   await expect(manager.findPersistedAgent("codex", "session-direct")).resolves.toBe(descriptors[0]);
   await expect(manager.findPersistedAgent("codex", "native-match")).resolves.toBe(descriptors[1]);
   await expect(manager.findPersistedAgent("codex", "missing")).resolves.toBeNull();
+  await expect(
+    manager.findPersistedAgent("codex", "session-direct", { cwd: "/tmp/project" }),
+  ).resolves.toBe(descriptors[0]);
   expect(client.lastLimit).toBe(200);
+  expect(client.lastCwd).toBe("/tmp/project");
 });
 
 test("reloadAgentSession passes daemon launch env through the provider launch context", async () => {
@@ -1283,6 +1291,7 @@ test("reloadAgentSession passes daemon launch env through the provider launch co
   });
 
   expect(client.lastCreateLaunchContext).toEqual({
+    agentId: snapshot.id,
     env: {
       PASEO_AGENT_ID: snapshot.id,
     },
@@ -1293,6 +1302,7 @@ test("reloadAgentSession passes daemon launch env through the provider launch co
   });
 
   expect(client.lastResumeLaunchContext).toEqual({
+    agentId: snapshot.id,
     env: {
       PASEO_AGENT_ID: snapshot.id,
     },
@@ -4191,6 +4201,8 @@ test("turn_failed surfaces provider code and diagnostic in system error message"
 
   await expect(manager.runAgent(agent.id, "hello")).rejects.toThrow("Provider execution failed");
 
+  expect(manager.getAgent(agent.id)?.lastError).toBe("Provider execution failed");
+
   const systemError = manager
     .getTimeline(agent.id)
     .find(
@@ -4996,6 +5008,69 @@ test("hydrateTimeline keeps provider user_message items when no canonical user h
   const assistantMessages = timeline.filter((item) => item.type === "assistant_message");
   expect(userMessages).toHaveLength(2);
   expect(assistantMessages).toHaveLength(2);
+});
+
+test("hydrateTimeline preserves provider replay timestamps and marks missing ones untrusted", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-timestamps-"));
+  const storagePath = join(workdir, "agents");
+  const storage = new AgentStorage(storagePath, logger);
+
+  class TimestampedHistorySession extends TestAgentSession {
+    async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      yield {
+        type: "timeline",
+        provider: this.provider,
+        timestamp: "2026-05-01T10:00:00.000Z",
+        item: { type: "user_message", text: "hello", messageId: "msg_history_1" },
+      };
+      yield {
+        type: "timeline",
+        provider: this.provider,
+        item: { type: "assistant_message", text: "no original timestamp" },
+      };
+    }
+  }
+
+  class TimestampedHistoryClient implements AgentClient {
+    readonly provider = "codex" as const;
+    readonly capabilities = TEST_CAPABILITIES;
+
+    async isAvailable(): Promise<boolean> {
+      return true;
+    }
+
+    async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new TimestampedHistorySession(config);
+    }
+
+    async resumeSession(): Promise<AgentSession> {
+      throw new Error("Not used in this test");
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: {
+      codex: new TimestampedHistoryClient(),
+    },
+    registry: storage,
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000204",
+  });
+
+  const snapshot = await manager.createAgent({
+    provider: "codex",
+    cwd: workdir,
+  });
+
+  await manager.hydrateTimelineFromProvider(snapshot.id);
+  const timeline = manager.fetchTimeline(snapshot.id, { direction: "tail", limit: 0 }).rows;
+
+  expect(timeline).toHaveLength(2);
+  expect(timeline[0]).toMatchObject({
+    timestamp: "2026-05-01T10:00:00.000Z",
+    item: { type: "user_message", text: "hello", messageId: "msg_history_1" },
+  });
+  expect(timeline[1]?.timestamp).toEqual(expect.any(String));
 });
 
 test("hydrateTimeline suppresses only matching canonical user_message messageId", async () => {

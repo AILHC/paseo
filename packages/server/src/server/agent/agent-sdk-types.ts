@@ -71,6 +71,15 @@ export interface AgentSelectOption {
   metadata?: AgentMetadata;
 }
 
+export function normalizeAgentModelDefinition(model: AgentModelDefinition): AgentModelDefinition {
+  const defaultThinkingOptionId =
+    model.defaultThinkingOptionId ?? model.thinkingOptions?.find((option) => option.isDefault)?.id;
+  if (!defaultThinkingOptionId || defaultThinkingOptionId === model.defaultThinkingOptionId) {
+    return model;
+  }
+  return { ...model, defaultThinkingOptionId };
+}
+
 export interface ProviderSnapshotEntry {
   provider: AgentProvider;
   status: ProviderStatus;
@@ -304,7 +313,7 @@ export interface CompactionTimelineItem {
 
 export type AgentTimelineItem =
   | { type: "user_message"; text: string; messageId?: string }
-  | { type: "assistant_message"; text: string }
+  | { type: "assistant_message"; text: string; messageId?: string }
   | { type: "reasoning"; text: string }
   | ToolCallTimelineItem
   | { type: "todo"; items: { text: string; completed: boolean }[] }
@@ -337,7 +346,13 @@ export type AgentStreamEvent =
       turnId?: string;
     }
   | { type: "turn_canceled"; provider: AgentProvider; reason: string; turnId?: string }
-  | { type: "timeline"; item: AgentTimelineItem; provider: AgentProvider; turnId?: string }
+  | {
+      type: "timeline";
+      item: AgentTimelineItem;
+      provider: AgentProvider;
+      turnId?: string;
+      timestamp?: string;
+    }
   | {
       type: "permission_requested";
       provider: AgentProvider;
@@ -357,6 +372,10 @@ export type AgentStreamEvent =
       reason: "finished" | "error" | "permission";
       timestamp: string;
     };
+
+export function getAgentStreamEventTurnId(event: AgentStreamEvent): string | undefined {
+  return "turnId" in event ? event.turnId : undefined;
+}
 
 export type AgentPermissionRequestKind = "tool" | "plan" | "question" | "mode" | "other";
 
@@ -476,6 +495,7 @@ export interface AgentSessionConfig {
 }
 
 export interface AgentLaunchContext {
+  agentId?: string;
   env?: Record<string, string>;
 }
 
@@ -558,6 +578,8 @@ export interface AgentClient {
   ): Promise<AgentSession>;
   listModels(options: ListModelsOptions): Promise<AgentModelDefinition[]>;
   listModes?(options: ListModesOptions): Promise<AgentMode[]>;
+  listCommands?(config: AgentSessionConfig): Promise<AgentSlashCommand[]>;
+  listFeatures?(config: AgentSessionConfig): Promise<AgentFeature[]>;
   listPersistedAgents?(options?: ListPersistedAgentsOptions): Promise<PersistedAgentDescriptor[]>;
   /**
    * Check if this provider is available (CLI binary is installed).

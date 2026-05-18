@@ -1,6 +1,6 @@
 {
   "name": "paseo",
-  "version": "0.1.74",
+  "version": "0.1.78",
   "private": true,
   "description": "Paseo: voice-controlled development environment with OpenAI Realtime API",
   "keywords": [
@@ -93,6 +93,7 @@
   "devDependencies": {
     "@types/ws": "^8.5.14",
     "@typescript/native-preview": "7.0.0-dev.20260423.1",
+    "@vercel/nft": "^1.5.0",
     "concurrently": "^9.2.1",
     "cross-env": "^10.1.0",
     "get-port-cli": "^3.0.0",

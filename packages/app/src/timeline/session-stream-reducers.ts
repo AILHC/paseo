@@ -3,7 +3,13 @@ import type { AgentLifecycleStatus } from "@server/shared/agent-lifecycle";
 import type { Agent } from "@/stores/session-store";
 import { useSessionStore } from "@/stores/session-store";
 import type { StreamItem } from "@/types/stream";
-import { applyStreamEvent, hydrateStreamState, reduceStreamUpdate } from "@/types/stream";
+import {
+  applyStreamEvent,
+  hydrateStreamState,
+  isAgentToolCallItem,
+  mergeAgentToolCallItem,
+  reduceStreamUpdate,
+} from "@/types/stream";
 
 const AGENT_STREAM_REDUCER_FLUSH_DELAY_MS = 16 * 3;
 
@@ -346,6 +352,21 @@ function mergePrependedCanonicalTail(olderTail: StreamItem[], currentTail: Strea
 
   const olderLast = olderTail.at(-1);
   const currentFirst = currentTail[0];
+
+  if (
+    olderLast &&
+    currentFirst &&
+    isAgentToolCallItem(olderLast) &&
+    isAgentToolCallItem(currentFirst) &&
+    olderLast.payload.data.callId === currentFirst.payload.data.callId
+  ) {
+    return [
+      ...olderTail.slice(0, -1),
+      mergeAgentToolCallItem(olderLast, currentFirst.payload.data, currentFirst.timestamp),
+      ...currentTail.slice(1),
+    ];
+  }
+
   if (olderLast?.kind !== "assistant_message" || currentFirst?.kind !== "assistant_message") {
     return [...olderTail, ...currentTail];
   }
@@ -395,7 +416,10 @@ function applyTimelineIncrementalPath(args: {
   if (acceptedUnits.length > 0) {
     if (payload.direction === "before") {
       const olderTail = hydrateStreamState(
-        acceptedUnits.map(({ event, timestamp }) => ({ event, timestamp })),
+        acceptedUnits.map(({ event, timestamp }) => ({
+          event,
+          timestamp,
+        })),
         { source: "canonical" },
       );
       nextTail = mergePrependedCanonicalTail(olderTail, currentTail);
@@ -414,7 +438,9 @@ function applyTimelineIncrementalPath(args: {
     } else {
       nextTail = acceptedUnits.reduce<StreamItem[]>(
         (state, { event, timestamp }) =>
-          reduceStreamUpdate(state, event, timestamp, { source: "canonical" }),
+          reduceStreamUpdate(state, event, timestamp, {
+            source: "canonical",
+          }),
         currentTail,
       );
     }
@@ -482,7 +508,7 @@ export function processTimelineResponse(
   }));
 
   const toHydratedEvents = (
-    units: typeof timelineUnits,
+    units: TimelineUnit[],
   ): Array<{ event: AgentStreamEventPayload; timestamp: Date }> =>
     units.map(({ event, timestamp }) => ({ event, timestamp }));
 

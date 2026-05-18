@@ -37,9 +37,22 @@ PASEO_DEV_RESET_HOME=1 npm run dev            # clear and reseed the derived wor
 
 In any worktree-style or portless setup, never assume default ports.
 
+### Desktop renderer profiling
+
+`npm run dev:desktop` starts Electron with Chromium remote debugging enabled on
+`http://127.0.0.1:9223` so renderer CPU profiles can be captured through CDP.
+Override the port with `PASEO_ELECTRON_REMOTE_DEBUGGING_PORT` when `9223` is busy.
+
 ### Daemon logs
 
-Check `$PASEO_HOME/daemon.log` for trace-level logs.
+Check `$PASEO_HOME/daemon.log` for daemon logs. The default level is `info`; set
+`PASEO_LOG_LEVEL=trace` before launching the daemon when you need full provider,
+session, and agent-manager traces for stuck-state debugging.
+
+The supervisor rotates `daemon.log`. Persisted `log.file.rotate` settings in
+`$PASEO_HOME/config.json` win first. Without persisted config, the optional
+`PASEO_LOG_ROTATE_SIZE` and `PASEO_LOG_ROTATE_COUNT` env vars override the
+defaults. The default rotation is `10m` x `3` files everywhere.
 
 ## paseo.json service scripts
 

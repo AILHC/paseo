@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AgentStreamEventPayload } from "@server/shared/messages";
-import type { StreamItem } from "@/types/stream";
+import { hydrateStreamState, type AgentToolCallItem, type StreamItem } from "@/types/stream";
 import {
   createAgentStreamReducerQueue,
   processTimelineResponse,
@@ -27,6 +27,28 @@ function makeTimelineEntry(
     seqEnd,
     provider: "claude",
     item: { type, text },
+    timestamp: new Date(1000 + seq).toISOString(),
+  };
+}
+
+function makeToolCallTimelineEntry(
+  seq: number,
+  callId: string,
+  status: "running" | "completed",
+  detail: Record<string, unknown>,
+) {
+  return {
+    seqStart: seq,
+    seqEnd: seq,
+    provider: "claude",
+    item: {
+      type: "tool_call",
+      callId,
+      name: "Read",
+      status,
+      detail,
+      error: null,
+    },
     timestamp: new Date(1000 + seq).toISOString(),
   };
 }
@@ -95,6 +117,13 @@ function getUserTexts(items: StreamItem[]): string[] {
       return item.kind === "user_message";
     })
     .map((item) => item.text);
+}
+
+function getAgentToolCalls(items: StreamItem[]) {
+  return items.filter(
+    (item): item is AgentToolCallItem =>
+      item.kind === "tool_call" && item.payload.source === "agent",
+  );
 }
 
 const baseTimelineInput: ProcessTimelineResponseInput = {
@@ -216,6 +245,34 @@ describe("processTimelineResponse", () => {
     });
     expect(result.error).toBe(null);
     expect(result.sideEffects.some((e) => e.type === "flush_pending_updates")).toBe(true);
+  });
+
+  it("uses the timeline entry timestamp as canonical", () => {
+    const result = processTimelineResponse({
+      ...baseTimelineInput,
+      payload: {
+        ...baseTimelineInput.payload,
+        reset: true,
+        startCursor: { seq: 1 },
+        endCursor: { seq: 2 },
+        entries: [
+          {
+            ...makeTimelineEntry(1, "hello", "user_message"),
+            timestamp: new Date("2025-01-01T12:00:03Z").toISOString(),
+          },
+          {
+            ...makeTimelineEntry(2, "reply"),
+            timestamp: new Date("2025-01-01T12:00:04Z").toISOString(),
+          },
+        ],
+      },
+    });
+
+    const user = result.tail.find((item) => item.kind === "user_message");
+    const assistant = result.tail.find((item) => item.kind === "assistant_message");
+
+    expect(user?.timestamp.toISOString()).toBe("2025-01-01T12:00:03.000Z");
+    expect(assistant?.timestamp.toISOString()).toBe("2025-01-01T12:00:04.000Z");
   });
 
   it("sets cursor to null when reset=true but no cursors in payload", () => {
@@ -480,6 +537,146 @@ describe("processTimelineResponse", () => {
       startSeq: 1,
       endSeq: 5,
     });
+  });
+
+  it("coalesces tool call lifecycle rows across the older-page prepend boundary", () => {
+    const callId = "toolu_boundary";
+    const currentTail = hydrateStreamState(
+      [
+        {
+          event: {
+            type: "timeline",
+            provider: "claude",
+            item: makeToolCallTimelineEntry(3, callId, "completed", {
+              type: "read",
+              filePath: "/tmp/example.ts",
+            }).item,
+          } as AgentStreamEventPayload,
+          timestamp: new Date(3000),
+        },
+      ],
+      { source: "canonical" },
+    );
+    const existingCursor: TimelineCursor = {
+      epoch: "epoch-1",
+      startSeq: 3,
+      endSeq: 5,
+    };
+
+    const result = processTimelineResponse({
+      ...baseTimelineInput,
+      currentTail,
+      currentCursor: existingCursor,
+      payload: {
+        ...baseTimelineInput.payload,
+        direction: "before",
+        epoch: "epoch-1",
+        startCursor: { seq: 1 },
+        endCursor: { seq: 2 },
+        entries: [
+          makeToolCallTimelineEntry(1, callId, "running", {
+            type: "unknown",
+            input: { file_path: "/tmp/example.ts" },
+            output: null,
+          }),
+        ],
+      },
+    });
+
+    const toolCalls = getAgentToolCalls(result.tail);
+    expect(
+      toolCalls.map((item) => ({
+        id: item.id,
+        callId: item.payload.data.callId,
+        status: item.payload.data.status,
+        detailType: item.payload.data.detail.type,
+      })),
+    ).toEqual([
+      {
+        id: `agent_tool_${callId}`,
+        callId,
+        status: "completed",
+        detailType: "read",
+      },
+    ]);
+  });
+
+  it("does not coalesce tool call lifecycle rows away from the prepend boundary", () => {
+    const callId = "toolu_not_boundary";
+    const currentTail = hydrateStreamState(
+      [
+        {
+          event: makeTimelineEvent("current chunk"),
+          timestamp: new Date(3000),
+        },
+        {
+          event: {
+            type: "timeline",
+            provider: "claude",
+            item: makeToolCallTimelineEntry(4, callId, "completed", {
+              type: "read",
+              filePath: "/tmp/example.ts",
+            }).item,
+          } as AgentStreamEventPayload,
+          timestamp: new Date(4000),
+        },
+      ],
+      { source: "canonical" },
+    );
+    const existingCursor: TimelineCursor = {
+      epoch: "epoch-1",
+      startSeq: 3,
+      endSeq: 5,
+    };
+
+    const result = processTimelineResponse({
+      ...baseTimelineInput,
+      currentTail,
+      currentCursor: existingCursor,
+      payload: {
+        ...baseTimelineInput.payload,
+        direction: "before",
+        epoch: "epoch-1",
+        startCursor: { seq: 1 },
+        endCursor: { seq: 2 },
+        entries: [
+          makeToolCallTimelineEntry(1, callId, "running", {
+            type: "unknown",
+            input: { file_path: "/tmp/example.ts" },
+            output: null,
+          }),
+          makeTimelineEntry(2, "older chunk "),
+        ],
+      },
+    });
+
+    expect(
+      result.tail.map((item) => ({
+        kind: item.kind,
+        id: item.id,
+        status: item.kind === "tool_call" ? item.payload.data.status : null,
+        text: item.kind === "assistant_message" ? item.text : null,
+      })),
+    ).toEqual([
+      {
+        kind: "tool_call",
+        id: `agent_tool_${callId}`,
+        status: "running",
+        text: null,
+      },
+      {
+        kind: "assistant_message",
+        id: expect.any(String),
+        status: null,
+        text: "older chunk current chunk",
+      },
+      {
+        kind: "tool_call",
+        id: `agent_tool_${callId}`,
+        status: "completed",
+        text: null,
+      },
+    ]);
   });
 
   it("requests canonical catch-up when a projected entry overlaps unseen seqs", () => {

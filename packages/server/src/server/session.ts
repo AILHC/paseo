@@ -82,7 +82,11 @@ import type { DaemonConfigStore } from "./daemon-config-store.js";
 import { applyMutableProviderConfigToOverrides } from "./daemon-config-store.js";
 import { getErrorMessage, getErrorMessageOr } from "../shared/error-utils.js";
 import { getAgentStatusPriority } from "../shared/agent-state-bucket.js";
-import type { WorkspaceGitRuntimeSnapshot, WorkspaceGitService } from "./workspace-git-service.js";
+import type {
+  WorkspaceGitRuntimeSnapshot,
+  WorkspaceGitService,
+  WorkspaceGitSnapshotOptions,
+} from "./workspace-git-service.js";
 
 import { buildProviderRegistry } from "./agent/provider-registry.js";
 import type {
@@ -92,6 +96,7 @@ import type {
 import { AgentManager } from "./agent/agent-manager.js";
 import { ProviderSnapshotManager, resolveSnapshotCwd } from "./agent/provider-snapshot-manager.js";
 import type {
+  AgentManagerEvent,
   AgentTimelineCursor,
   AgentTimelineFetchDirection,
   ManagedAgent,
@@ -119,16 +124,17 @@ import {
   StructuredAgentResponseError,
   generateStructuredAgentResponseWithFallback,
 } from "./agent/agent-response-loop.js";
-import type {
-  AgentPersistenceHandle,
-  AgentPermissionResponse,
-  AgentProvider,
-  AgentPromptContentBlock,
-  AgentPromptInput,
-  AgentRunOptions,
-  AgentSessionConfig,
-  AgentStreamEvent,
-  ProviderSnapshotEntry,
+import {
+  getAgentStreamEventTurnId,
+  type AgentPersistenceHandle,
+  type AgentPermissionResponse,
+  type AgentProvider,
+  type AgentPromptContentBlock,
+  type AgentPromptInput,
+  type AgentRunOptions,
+  type AgentSessionConfig,
+  type AgentStreamEvent,
+  type ProviderSnapshotEntry,
 } from "./agent/agent-sdk-types.js";
 import type { StoredAgentRecord } from "./agent/agent-storage.js";
 import type { AgentStorage } from "./agent/agent-storage.js";
@@ -148,6 +154,7 @@ import {
 import {
   createPersistedProjectRecord,
   createPersistedWorkspaceRecord,
+  resolveProjectDisplayName,
   type PersistedProjectRecord,
   type PersistedWorkspaceRecord,
   type ProjectRegistry,
@@ -210,6 +217,8 @@ import { LoopService } from "./loop-service.js";
 import { ScheduleService } from "./schedule/service.js";
 import { execCommand } from "../utils/spawn.js";
 import {
+  assertPullRequestAutoMergeDisableReady,
+  assertPullRequestAutoMergeEnableReady,
   createGitHubService,
   type GitHubService,
   type PullRequestTimelineItem,
@@ -240,6 +249,12 @@ import {
 import { toWorktreeWireError } from "./worktree-errors.js";
 
 const WORKSPACE_GIT_WATCH_REMOVED_STATE_KEY = "__removed__";
+
+type CurrentWorkspacePullRequest = NonNullable<
+  WorkspaceGitRuntimeSnapshot["github"]["pullRequest"]
+> & {
+  number: number;
+};
 
 interface ResolveKnownProjectRootForConfigInput {
   repoRoot: string;
@@ -287,6 +302,8 @@ type GitMutationRefreshReason =
   | "merge-to-base"
   | "merge-from-base"
   | "merge-pr"
+  | "enable-pr-auto-merge"
+  | "disable-pr-auto-merge"
   | "create-pr"
   | "switch-branch"
   | "create-branch"
@@ -545,6 +562,7 @@ export interface SessionOptions {
   daemonConfigStore: DaemonConfigStore;
   mcpBaseUrl?: string | null;
   stt: Resolvable<SpeechToTextProvider | null>;
+  sttLanguage?: string;
   tts: Resolvable<TextToSpeechProvider | null>;
   terminalManager: TerminalManager | null;
   providerSnapshotManager?: ProviderSnapshotManager;
@@ -571,6 +589,7 @@ export interface SessionOptions {
   dictation?: {
     finalTimeoutMs?: number;
     stt?: Resolvable<SpeechToTextProvider | null>;
+    sttLanguage?: string;
     getSpeechReadiness?: () => SpeechReadinessSnapshot;
   };
   agentProviderRuntimeSettings?: AgentProviderRuntimeSettingsMap;
@@ -782,6 +801,7 @@ export class Session {
   private registerVoiceCallerContext?: (agentId: string, context: VoiceCallerContext) => void;
   private unregisterVoiceCallerContext?: (agentId: string) => void;
   private getSpeechReadiness?: () => SpeechReadinessSnapshot;
+  private readonly sttLanguage: string;
   private readonly agentProviderRuntimeSettings: AgentProviderRuntimeSettingsMap | undefined;
   private readonly providerOverrides: Record<string, ProviderOverride> | undefined;
   private readonly isDev: boolean;
@@ -813,6 +833,7 @@ export class Session {
       daemonConfigStore,
       mcpBaseUrl,
       stt,
+      sttLanguage,
       tts,
       terminalManager,
       providerSnapshotManager,
@@ -874,6 +895,7 @@ export class Session {
     this.getDaemonTcpPort = getDaemonTcpPort ?? null;
     this.getDaemonTcpHost = getDaemonTcpHost ?? null;
     this.resolveScriptHealth = resolveScriptHealth ?? null;
+    this.sttLanguage = sttLanguage ?? "en";
     this.subscribeToOptionalManagers();
     this.bindVoiceBridges({ voice, voiceBridge, dictation });
     this.agentProviderRuntimeSettings = agentProviderRuntimeSettings;
@@ -889,13 +911,13 @@ export class Session {
       buildWorkspaceDescriptor: (input) => this.buildWorkspaceDescriptor(input),
     });
 
-    this.initializePerSessionManagers({ tts, stt, dictation });
+    this.initializePerSessionManagers({ tts, stt, sttLanguage, dictation });
 
     // Initialize agent MCP client asynchronously
     void this.initializeAgentMcp();
     this.subscribeToAgentEvents();
 
-    this.sessionLogger.trace("Session created");
+    this.sessionLogger.trace({}, "agent.session.lifecycle.created");
   }
 
   updateAppVersion(appVersion: string | null): void {
@@ -1017,15 +1039,20 @@ export class Session {
   private async interruptAgentIfRunning(agentId: string): Promise<void> {
     const snapshot = this.agentManager.getAgent(agentId);
     if (!snapshot) {
-      this.sessionLogger.trace({ agentId }, "interruptAgentIfRunning: agent not found");
+      this.sessionLogger.trace({ agentId }, "agent.session.interrupt.not_found");
       throw new Error(`Agent ${agentId} not found`);
     }
 
     const hasInFlightRun = this.agentManager.hasInFlightRun(agentId);
     if (!hasInFlightRun) {
       this.sessionLogger.trace(
-        { agentId, lifecycle: snapshot.lifecycle, hasInFlightRun },
-        "interruptAgentIfRunning: skipping because agent is not running",
+        {
+          agentId,
+          provider: snapshot.provider,
+          lifecycle: snapshot.lifecycle,
+          hasInFlightRun,
+        },
+        "agent.session.interrupt.skip_not_running",
       );
       return;
     }
@@ -1070,7 +1097,7 @@ export class Session {
         promptType: typeof prompt === "string" ? "string" : "structured",
         hasRunOptions: Boolean(runOptions),
       },
-      "startAgentStream: requested",
+      "agent.session.start_stream.request",
     );
     let iterator: AsyncGenerator<AgentStreamEvent>;
     try {
@@ -1080,7 +1107,7 @@ export class Session {
         : this.agentManager.streamAgent(agentId, prompt, runOptions);
       this.sessionLogger.trace(
         { agentId, shouldReplace },
-        "startAgentStream: agent iterator returned",
+        "agent.session.start_stream.iterator_returned",
       );
     } catch (error) {
       this.handleAgentRunError(agentId, error, "Failed to start agent run");
@@ -1092,9 +1119,9 @@ export class Session {
         for await (const _ of iterator) {
           // Events are forwarded via the session's AgentManager subscription.
         }
-        this.sessionLogger.trace({ agentId }, "startAgentStream: iterator drained");
+        this.sessionLogger.trace({ agentId }, "agent.session.iterator.drained");
       } catch (error) {
-        this.sessionLogger.trace({ agentId, err: error }, "startAgentStream: iterator threw");
+        this.sessionLogger.trace({ agentId, err: error }, "agent.session.iterator.error");
         this.handleAgentRunError(agentId, error, "Agent stream failed");
       }
     })();
@@ -1135,10 +1162,7 @@ export class Session {
 
       this.agentTools = (await this.agentMcpClient.tools()) as ToolSet;
       const agentToolCount = Object.keys(this.agentTools ?? {}).length;
-      this.sessionLogger.trace(
-        { agentToolCount },
-        `Agent MCP initialized with ${agentToolCount} tools`,
-      );
+      this.sessionLogger.trace({ agentToolCount }, "agent.session.mcp_init");
     } catch (error) {
       this.sessionLogger.error({ err: error }, "Failed to initialize Agent MCP");
     }
@@ -1188,16 +1212,20 @@ export class Session {
   private initializePerSessionManagers(params: {
     tts: SessionOptions["tts"];
     stt: SessionOptions["stt"];
+    sttLanguage: SessionOptions["sttLanguage"];
     dictation: SessionOptions["dictation"];
   }): void {
-    const { tts, stt, dictation } = params;
+    const { tts, stt, sttLanguage, dictation } = params;
     this.ttsManager = new TTSManager(this.sessionId, this.sessionLogger, tts);
-    this.sttManager = new STTManager(this.sessionId, this.sessionLogger, stt);
+    this.sttManager = new STTManager(this.sessionId, this.sessionLogger, stt, {
+      language: sttLanguage,
+    });
     this.dictationStreamManager = new DictationStreamManager({
       logger: this.sessionLogger,
       sessionId: this.sessionId,
       emit: (msg) => this.handleDictationManagerMessage(msg),
       stt: dictation?.stt ?? null,
+      language: dictation?.sttLanguage,
       finalTimeoutMs: dictation?.finalTimeoutMs,
     });
   }
@@ -1210,6 +1238,16 @@ export class Session {
     this.unsubscribeAgentEvents = this.agentManager.subscribe(
       (event) => {
         if (event.type === "agent_state") {
+          this.sessionLogger.trace(
+            {
+              agentId: event.agent.id,
+              provider: event.agent.provider,
+              providerSessionId: event.agent.persistence?.sessionId ?? undefined,
+              turnId: event.agent.activeForegroundTurnId ?? undefined,
+              lifecycle: event.agent.lifecycle,
+            },
+            "agent.session.forward_update",
+          );
           void this.forwardAgentUpdate(event.agent);
           return;
         }
@@ -1240,38 +1278,29 @@ export class Session {
         // Reduce bandwidth/CPU on mobile: only forward high-frequency agent stream events
         // for the focused agent, with a short grace window while backgrounded.
         // History catch-up is handled via pull-based `fetch_agent_timeline_request`.
-        const activity = this.clientActivity;
-        if (activity?.deviceType === "mobile") {
-          if (!activity.focusedAgentId) {
-            return;
-          }
-          if (activity.focusedAgentId !== event.agentId) {
-            return;
-          }
-          if (!activity.appVisible) {
-            const hiddenForMs = Date.now() - activity.appVisibilityChangedAt.getTime();
-            if (hiddenForMs >= this.MOBILE_BACKGROUND_STREAM_GRACE_MS) {
-              return;
-            }
-          }
+        if (this.shouldSkipAgentStreamForward(event.agentId)) {
+          return;
         }
 
         const serializedEvent = serializeAgentStreamEvent(event.event);
         if (!serializedEvent) {
           return;
         }
-
-        const payload = {
-          agentId: event.agentId,
-          event: serializedEvent,
-          timestamp: new Date().toISOString(),
-          ...(typeof event.seq === "number" ? { seq: event.seq } : {}),
-          ...(typeof event.epoch === "string" ? { epoch: event.epoch } : {}),
-        } as const;
+        this.sessionLogger.trace(
+          {
+            agentId: event.agentId,
+            provider: event.event.provider,
+            turnId: getAgentStreamEventTurnId(event.event),
+            seq: event.seq,
+            epoch: event.epoch,
+            event: event.event,
+          },
+          "agent.session.forward_stream",
+        );
 
         this.emit({
           type: "agent_stream",
-          payload,
+          payload: this.buildAgentStreamPayload(event, serializedEvent),
         });
 
         if (event.event.type === "permission_requested") {
@@ -1297,6 +1326,34 @@ export class Session {
       },
       { replayState: false },
     );
+  }
+
+  private shouldSkipAgentStreamForward(agentId: string): boolean {
+    const activity = this.clientActivity;
+    if (activity?.deviceType !== "mobile") {
+      return false;
+    }
+    if (!activity.focusedAgentId || activity.focusedAgentId !== agentId) {
+      return true;
+    }
+    if (activity.appVisible) {
+      return false;
+    }
+    const hiddenForMs = Date.now() - activity.appVisibilityChangedAt.getTime();
+    return hiddenForMs >= this.MOBILE_BACKGROUND_STREAM_GRACE_MS;
+  }
+
+  private buildAgentStreamPayload(
+    event: Extract<AgentManagerEvent, { type: "agent_stream" }>,
+    serializedEvent: Extract<SessionOutboundMessage, { type: "agent_stream" }>["payload"]["event"],
+  ): Extract<SessionOutboundMessage, { type: "agent_stream" }>["payload"] {
+    return {
+      agentId: event.agentId,
+      event: serializedEvent,
+      timestamp: event.timestamp ?? new Date().toISOString(),
+      ...(typeof event.seq === "number" ? { seq: event.seq } : {}),
+      ...(typeof event.epoch === "string" ? { epoch: event.epoch } : {}),
+    };
   }
 
   private async buildAgentPayload(agent: ManagedAgent): Promise<AgentSnapshotPayload> {
@@ -1529,7 +1586,7 @@ export class Session {
     const checkout = buildWorkspaceCheckout(workspace, project);
     return {
       projectKey: project.projectId,
-      projectName: project.displayName,
+      projectName: resolveProjectDisplayName(project),
       checkout,
     };
   }
@@ -1612,8 +1669,11 @@ export class Session {
     }
     try {
       this.sessionLogger.trace(
-        { messageType: msg.type, payloadBytes: JSON.stringify(msg).length },
-        "inbound message",
+        {
+          messageType: msg.type,
+          payloadBytes: JSON.stringify(msg).length,
+        },
+        "agent.session.inbound",
       );
       try {
         await this.dispatchInboundMessage(msg);
@@ -1756,6 +1816,8 @@ export class Session {
         return this.handleCloseItemsRequest(msg);
       case "update_agent_request":
         return this.handleUpdateAgentRequest(msg.agentId, msg.name, msg.labels, msg.requestId);
+      case "project.rename.request":
+        return this.handleProjectRenameRequest(msg.projectId, msg.customName, msg.requestId);
       case "send_agent_message_request":
         return this.handleSendAgentMessageRequest(msg);
       case "wait_for_finish_request":
@@ -1977,6 +2039,8 @@ export class Session {
         return this.handleCheckoutPrCreateRequest(msg);
       case "checkout_pr_merge_request":
         return this.handleCheckoutPrMergeRequest(msg);
+      case "checkout.github.set_auto_merge.request":
+        return this.handleCheckoutGithubSetAutoMergeRequest(msg);
       case "checkout_pr_status_request":
         return this.handleCheckoutPrStatusRequest(msg);
       case "pull_request_timeline_request":
@@ -2443,6 +2507,90 @@ export class Session {
     }
   }
 
+  private async handleProjectRenameRequest(
+    projectId: string,
+    customName: string | null,
+    requestId: string,
+  ): Promise<void> {
+    this.sessionLogger.info(
+      { projectId, requestId, hasCustomName: typeof customName === "string" },
+      "session: project.rename.request",
+    );
+
+    try {
+      const existing = await this.projectRegistry.get(projectId);
+      if (!existing) {
+        this.emit({
+          type: "project.rename.response",
+          payload: {
+            requestId,
+            projectId,
+            accepted: false,
+            customName: null,
+            error: "Project not found",
+          },
+        });
+        return;
+      }
+
+      const trimmed = customName?.trim() ?? "";
+      const nextCustomName = trimmed.length === 0 ? null : trimmed;
+
+      await this.projectRegistry.upsert({
+        ...existing,
+        customName: nextCustomName,
+        updatedAt: new Date().toISOString(),
+      });
+
+      this.emit({
+        type: "project.rename.response",
+        payload: {
+          requestId,
+          projectId,
+          accepted: true,
+          customName: nextCustomName,
+          error: null,
+        },
+      });
+
+      // Re-emit descriptors for every workspace under this project so the new
+      // resolved name lands in the UI immediately.
+      const workspaces = await this.workspaceRegistry.list();
+      const affectedWorkspaceIds = workspaces
+        .filter((workspace) => workspace.projectId === projectId)
+        .map((workspace) => workspace.workspaceId);
+      if (affectedWorkspaceIds.length > 0) {
+        await this.emitWorkspaceUpdatesForWorkspaceIds(affectedWorkspaceIds, {
+          skipReconcile: true,
+        });
+      }
+    } catch (error) {
+      this.sessionLogger.error(
+        { err: error, projectId, requestId },
+        "session: project.rename.request error",
+      );
+      this.emit({
+        type: "activity_log",
+        payload: {
+          id: uuidv4(),
+          timestamp: new Date(),
+          type: "error",
+          content: `Failed to rename project: ${getErrorMessage(error)}`,
+        },
+      });
+      this.emit({
+        type: "project.rename.response",
+        payload: {
+          requestId,
+          projectId,
+          accepted: false,
+          customName: null,
+          error: getErrorMessageOr(error, "Failed to rename project"),
+        },
+      });
+    }
+  }
+
   private toVoiceFeatureUnavailableContext(
     state: SpeechReadinessState,
   ): VoiceFeatureUnavailableContext {
@@ -2738,6 +2886,7 @@ export class Session {
       logger: this.sessionLogger.child({ component: "voice-turn-controller" }),
       turnDetection,
       stt,
+      sttLanguage: this.sttLanguage,
       callbacks: {
         onSpeechStarted: async () => {
           this.sessionLogger.debug("Voice VAD speech_started");
@@ -3048,6 +3197,17 @@ export class Session {
     const { handle, overrides, requestId } = msg;
     if (!handle) {
       this.sessionLogger.warn("Resume request missing persistence handle");
+      if (requestId) {
+        this.emit({
+          type: "rpc_error",
+          payload: {
+            requestId,
+            requestType: msg.type,
+            error: "Unable to resume agent: missing persistence handle",
+            code: "agent_resume_failed",
+          },
+        });
+      }
       this.emit({
         type: "activity_log",
         payload: {
@@ -3084,14 +3244,26 @@ export class Session {
         });
       }
     } catch (error) {
+      const message = getErrorMessage(error);
       this.sessionLogger.error({ err: error }, "Failed to resume agent");
+      if (requestId) {
+        this.emit({
+          type: "rpc_error",
+          payload: {
+            requestId,
+            requestType: msg.type,
+            error: message,
+            code: "agent_resume_failed",
+          },
+        });
+      }
       this.emit({
         type: "activity_log",
         payload: {
           id: uuidv4(),
           timestamp: new Date(),
           type: "error",
-          content: `Failed to resume agent: ${getErrorMessage(error)}`,
+          content: `Failed to resume agent: ${message}`,
         },
       });
     }
@@ -3212,14 +3384,26 @@ export class Session {
         });
       }
     } catch (error) {
+      const message = getErrorMessage(error);
       this.sessionLogger.error({ err: error, agentId }, `Failed to refresh agent ${agentId}`);
+      if (requestId) {
+        this.emit({
+          type: "rpc_error",
+          payload: {
+            requestId,
+            requestType: msg.type,
+            error: message,
+            code: "agent_refresh_failed",
+          },
+        });
+      }
       this.emit({
         type: "activity_log",
         payload: {
           id: uuidv4(),
           timestamp: new Date(),
           type: "error",
-          content: `Failed to refresh agent: ${getErrorMessage(error)}`,
+          content: `Failed to refresh agent: ${message}`,
         },
       });
     }
@@ -4521,7 +4705,7 @@ export class Session {
   }
 
   private async handleDirectorySuggestionsRequest(msg: DirectorySuggestionsRequest): Promise<void> {
-    const { query, limit, requestId, cwd, includeFiles, includeDirectories } = msg;
+    const { query, limit, requestId, cwd, includeFiles, includeDirectories, matchMode } = msg;
 
     try {
       const workspaceCwd = cwd?.trim();
@@ -4532,6 +4716,7 @@ export class Session {
             limit,
             includeFiles,
             includeDirectories,
+            matchMode,
           })
         : (
             await searchHomeDirectories({
@@ -5108,16 +5293,17 @@ export class Session {
     const { cwd, requestId } = msg;
 
     try {
-      const snapshot = await this.workspaceGitService.getSnapshot(cwd);
-      const prNumber = snapshot.github.pullRequest?.number;
-      if (typeof prNumber !== "number") {
-        throw new Error("Unable to determine GitHub pull request number for merge");
-      }
-
+      const pullRequest = await this.resolveCurrentPullRequest(cwd, "merge", {
+        force: true,
+        includeGitHub: true,
+        reason: "merge-pr-validation",
+      });
+      this.assertCurrentPullRequestHasGithubMergeFacts(pullRequest);
       await this.github.mergePullRequest({
         cwd,
-        prNumber,
+        prNumber: pullRequest.number,
         mergeMethod: msg.mergeMethod,
+        status: pullRequest,
       });
       await this.notifyGitMutation(cwd, "merge-pr", { invalidateGithub: true });
 
@@ -5141,6 +5327,96 @@ export class Session {
         },
       });
     }
+  }
+
+  private assertCurrentPullRequestHasGithubMergeFacts(
+    pullRequest: CurrentWorkspacePullRequest,
+  ): void {
+    if (!pullRequest.github) {
+      throw new Error("GitHub merge facts are unavailable for this pull request");
+    }
+  }
+
+  private async handleCheckoutGithubSetAutoMergeRequest(
+    msg: Extract<SessionInboundMessage, { type: "checkout.github.set_auto_merge.request" }>,
+  ): Promise<void> {
+    const { cwd, requestId } = msg;
+
+    try {
+      const pullRequest = await this.resolveCurrentPullRequest(cwd, "auto-merge", {
+        force: true,
+        includeGitHub: true,
+        reason: "auto-merge-validation",
+      });
+      if (msg.enabled) {
+        const mergeMethod = msg.mergeMethod;
+        if (!mergeMethod) {
+          throw new Error("mergeMethod is required when enabling auto-merge");
+        }
+        assertPullRequestAutoMergeEnableReady({
+          mergeMethod,
+          status: pullRequest,
+        });
+        await this.github.enablePullRequestAutoMerge({
+          cwd,
+          prNumber: pullRequest.number,
+          mergeMethod,
+          status: pullRequest,
+        });
+      } else {
+        if (msg.mergeMethod) {
+          throw new Error("mergeMethod is not allowed when disabling auto-merge");
+        }
+        assertPullRequestAutoMergeDisableReady({ status: pullRequest });
+        await this.github.disablePullRequestAutoMerge({
+          cwd,
+          prNumber: pullRequest.number,
+          status: pullRequest,
+        });
+      }
+      await this.notifyGitMutation(
+        cwd,
+        msg.enabled ? "enable-pr-auto-merge" : "disable-pr-auto-merge",
+        {
+          invalidateGithub: true,
+        },
+      );
+
+      this.emit({
+        type: "checkout.github.set_auto_merge.response",
+        payload: {
+          cwd,
+          enabled: msg.enabled,
+          success: true,
+          error: null,
+          requestId,
+        },
+      });
+    } catch (error) {
+      this.emit({
+        type: "checkout.github.set_auto_merge.response",
+        payload: {
+          cwd,
+          enabled: msg.enabled,
+          success: false,
+          error: toCheckoutError(error),
+          requestId,
+        },
+      });
+    }
+  }
+
+  private async resolveCurrentPullRequest(
+    cwd: string,
+    operation: "merge" | "auto-merge",
+    options?: WorkspaceGitSnapshotOptions,
+  ): Promise<CurrentWorkspacePullRequest> {
+    const snapshot = await this.workspaceGitService.getSnapshot(cwd, options);
+    const pullRequest = snapshot.github.pullRequest;
+    if (!pullRequest || typeof pullRequest.number !== "number") {
+      throw new Error(`Unable to determine GitHub pull request number for ${operation}`);
+    }
+    return { ...pullRequest, number: pullRequest.number };
   }
 
   private async handleCheckoutPrStatusRequest(
@@ -5831,7 +6107,10 @@ export class Session {
     return {
       id: workspace.workspaceId,
       projectId: workspace.projectId,
-      projectDisplayName: resolvedProjectRecord?.displayName ?? workspace.projectId,
+      projectDisplayName: resolvedProjectRecord
+        ? resolveProjectDisplayName(resolvedProjectRecord)
+        : workspace.projectId,
+      projectCustomName: resolvedProjectRecord?.customName ?? null,
       projectRootPath: resolvedProjectRecord?.rootPath ?? workspace.cwd,
       workspaceDirectory: workspace.cwd,
       projectKind: (resolvedProjectRecord?.kind ?? "directory") === "git" ? "git" : "non_git",
@@ -5919,7 +6198,10 @@ export class Session {
     return {
       id: result.workspace.workspaceId,
       projectId: result.workspace.projectId,
-      projectDisplayName: projectRecord?.displayName ?? result.workspace.projectId,
+      projectDisplayName: projectRecord
+        ? resolveProjectDisplayName(projectRecord)
+        : result.workspace.projectId,
+      projectCustomName: projectRecord?.customName ?? null,
       projectRootPath: projectRecord?.rootPath ?? result.repoRoot,
       workspaceDirectory: result.workspace.cwd,
       projectKind: "git",
@@ -7180,8 +7462,12 @@ export class Session {
 
       const prompt = this.buildAgentPrompt(msg.text, msg.images, msg.attachments);
       this.sessionLogger.trace(
-        { agentId, messageId: msg.messageId, textPrefix: msg.text.slice(0, 80) },
-        "send_agent_message_request: dispatching shared sendPromptToAgent",
+        {
+          agentId,
+          messageId: msg.messageId,
+          textPrefix: msg.text.slice(0, 80),
+        },
+        "agent.session.send_agent_message",
       );
       let dispatchResult: { outOfBand: boolean };
       try {
@@ -7966,8 +8252,11 @@ export class Session {
    */
   private emit(msg: SessionOutboundMessage): void {
     this.sessionLogger.trace(
-      { messageType: msg.type, payloadBytes: JSON.stringify(msg).length },
-      "outbound message",
+      {
+        messageType: msg.type,
+        payloadBytes: JSON.stringify(msg).length,
+      },
+      "agent.session.outbound",
     );
     if (
       msg.type === "audio_output" &&
@@ -8035,7 +8324,7 @@ export class Session {
    * Clean up session resources
    */
   public async cleanup(): Promise<void> {
-    this.sessionLogger.trace("Cleaning up");
+    this.sessionLogger.trace({}, "agent.session.lifecycle.cleanup");
 
     if (this.unsubscribeAgentEvents) {
       this.unsubscribeAgentEvents();

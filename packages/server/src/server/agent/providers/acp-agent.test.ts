@@ -1,7 +1,13 @@
 import { type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import type {
+import {
+  AgentSideConnection,
+  ClientSideConnection,
+  PROTOCOL_VERSION,
+  RequestError,
+  ndJsonStream,
+  type Agent,
   PermissionOption,
   PromptResponse,
   RequestPermissionRequest,
@@ -21,6 +27,15 @@ import {
   resolveACPModeSelection,
   resolveACPModelSelection,
 } from "./acp-agent.js";
+import {
+  COPILOT_ALLOW_ALL_MODE_ID,
+  COPILOT_MODES,
+  beforeCopilotModeWriter,
+  transformCopilotConfigOptions,
+  transformCopilotModeId,
+  transformCopilotSessionResponse,
+  writeCopilotProviderMode,
+} from "./copilot-acp-agent.js";
 import { transformPiModels } from "./pi-direct-agent.js";
 import type { AgentStreamEvent } from "../agent-sdk-types.js";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
@@ -140,6 +155,73 @@ function selectConfigOption(
   };
 }
 
+function createCopilotSessionWithConfig(modeId?: string | null): ACPAgentSession {
+  return new ACPAgentSession(
+    {
+      provider: "copilot",
+      cwd: "/tmp/paseo-acp-test",
+      modeId: modeId ?? undefined,
+    },
+    {
+      provider: "copilot",
+      logger: createTestLogger(),
+      defaultCommand: ["copilot", "--acp"],
+      defaultModes: COPILOT_MODES,
+      sessionResponseTransformer: transformCopilotSessionResponse,
+      configOptionsTransformer: transformCopilotConfigOptions,
+      modeIdTransformer: transformCopilotModeId,
+      providerModeWriter: writeCopilotProviderMode,
+      beforeModeWriter: beforeCopilotModeWriter,
+      capabilities: {
+        supportsStreaming: true,
+        supportsSessionPersistence: true,
+        supportsDynamicModes: true,
+        supportsMcpServers: true,
+        supportsReasoningStream: true,
+        supportsToolInvocations: true,
+      },
+    },
+  );
+}
+
+function copilotModeConfigOption(currentValue: string): SessionConfigOption {
+  return {
+    id: "mode",
+    name: "Mode",
+    category: "mode",
+    type: "select",
+    currentValue,
+    options: [
+      {
+        value: "https://agentclientprotocol.com/protocol/session-modes#agent",
+        name: "Agent",
+      },
+      {
+        value: "https://agentclientprotocol.com/protocol/session-modes#plan",
+        name: "Plan",
+      },
+      {
+        value: "https://agentclientprotocol.com/protocol/session-modes#autopilot",
+        name: "Autopilot",
+      },
+    ],
+  };
+}
+
+function copilotAllowAllConfigOption(currentValue: "on" | "off"): SessionConfigOption {
+  return {
+    id: "allow_all",
+    name: "Allow All",
+    category: "permissions",
+    type: "select",
+    currentValue,
+    options: [
+      { value: "on", name: "On" },
+      { value: "off", name: "Off" },
+    ],
+  };
+}
+
 function selectConfigOptionName(category: "mode" | "model" | "thought_level"): string {
   if (category === "mode") {
     return "Mode";
@@ -190,7 +272,7 @@ function prepareConfiguredOverrideSession(
 
 test("ACP setModel only uses config-option fallback when the matching select choice contains the model", async () => {
   const logger = createTestLogger();
-  const childLogger = { warn: vi.fn() };
+  const childLogger = { trace: vi.fn(), warn: vi.fn() };
   vi.spyOn(logger, "child").mockReturnValue(asInternals<typeof logger>(childLogger));
   const session = createSessionWithConfig({}, logger);
   const setSessionConfigOption = vi.fn(async () => ({
@@ -577,7 +659,7 @@ describe("ACPAgentSession Zed parity", () => {
     expect(await validSession.getCurrentMode()).toBe("default");
 
     const logger = createTestLogger();
-    const childLogger = { warn: vi.fn() };
+    const childLogger = { trace: vi.fn(), warn: vi.fn() };
     vi.spyOn(logger, "child").mockReturnValue(asInternals<typeof logger>(childLogger));
     const invalidSession = createSessionWithConfig(
       { modeId: "acceptEdits", model: "opus" },
@@ -796,12 +878,10 @@ describe("ACPAgentSession Zed parity", () => {
     });
   });
 
-  test("passes Copilot Autopilot ACP permission requests through to the user", async () => {
-    // Zed parity: Copilot Autopilot no longer auto-approves ACP permission requests,
-    // so the accepted UX regression is that every tool request reaches the user UI.
+  test("passes generic ACP permission requests through to the user", async () => {
     const session = createSessionWithConfig({
-      provider: "copilot",
-      modeId: "https://agentclientprotocol.com/protocol/session-modes#autopilot",
+      provider: "cursor-acp",
+      modeId: "https://agentclientprotocol.com/protocol/session-modes#agent",
     });
     const events: Array<{ type: string; request?: { id: string } }> = [];
     const permissionOptions: PermissionOption[] = [
@@ -834,6 +914,126 @@ describe("ACPAgentSession Zed parity", () => {
     await expect(permission).resolves.toEqual({
       outcome: { outcome: "selected", optionId: "allow-once" },
     });
+  });
+
+  test("maps Copilot Allow All mode to allow_all ACP config on session start", async () => {
+    const setSessionConfigOption = vi.fn(async () => ({
+      configOptions: [
+        copilotModeConfigOption("https://agentclientprotocol.com/protocol/session-modes#agent"),
+        copilotAllowAllConfigOption("on"),
+      ],
+    }));
+    const setSessionMode = vi.fn(async () => undefined);
+    const session = createCopilotSessionWithConfig(COPILOT_ALLOW_ALL_MODE_ID);
+    const { internals } = prepareConfiguredOverrideSession(session, {
+      currentMode: "https://agentclientprotocol.com/protocol/session-modes#agent",
+      availableModes: COPILOT_MODES,
+      configOptions: [
+        copilotModeConfigOption("https://agentclientprotocol.com/protocol/session-modes#agent"),
+        copilotAllowAllConfigOption("off"),
+      ],
+      connection: { setSessionConfigOption, setSessionMode },
+    });
+    const events: AgentStreamEvent[] = [];
+    const unsubscribe = session.subscribe((event) => events.push(event));
+    await internals.applyConfiguredOverrides();
+    unsubscribe();
+
+    expect(setSessionConfigOption).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      configId: "allow_all",
+      value: "on",
+    });
+    expect(setSessionMode).not.toHaveBeenCalled();
+    await expect(session.getCurrentMode()).resolves.toBe(COPILOT_ALLOW_ALL_MODE_ID);
+    expect(events.some((event) => event.type === "permission_requested")).toBe(false);
+  });
+
+  test("accepts Copilot's legacy autopilot mode ID as Allow All", async () => {
+    const setSessionConfigOption = vi.fn(async () => ({
+      configOptions: [
+        copilotModeConfigOption("https://agentclientprotocol.com/protocol/session-modes#agent"),
+        copilotAllowAllConfigOption("on"),
+      ],
+    }));
+    const setSessionMode = vi.fn(async () => undefined);
+    const session = createCopilotSessionWithConfig();
+    prepareConfiguredOverrideSession(session, {
+      currentMode: "https://agentclientprotocol.com/protocol/session-modes#agent",
+      availableModes: COPILOT_MODES,
+      configOptions: [
+        copilotModeConfigOption("https://agentclientprotocol.com/protocol/session-modes#agent"),
+        copilotAllowAllConfigOption("off"),
+      ],
+      connection: { setSessionConfigOption, setSessionMode },
+    });
+
+    await session.setMode("https://agentclientprotocol.com/protocol/session-modes#autopilot");
+
+    expect(setSessionConfigOption).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      configId: "allow_all",
+      value: "on",
+    });
+    expect(setSessionMode).not.toHaveBeenCalled();
+    await expect(session.getCurrentMode()).resolves.toBe(COPILOT_ALLOW_ALL_MODE_ID);
+  });
+
+  test("switching Copilot away from Allow All turns allow_all off before setting the ACP mode", async () => {
+    const setSessionConfigOption = vi.fn(async (input: { value: string }) => ({
+      configOptions: [
+        copilotModeConfigOption("https://agentclientprotocol.com/protocol/session-modes#agent"),
+        copilotAllowAllConfigOption(input.value === "on" ? "on" : "off"),
+      ],
+    }));
+    const setSessionMode = vi.fn(async () => undefined);
+    const session = createCopilotSessionWithConfig(COPILOT_ALLOW_ALL_MODE_ID);
+    prepareConfiguredOverrideSession(session, {
+      currentMode: COPILOT_ALLOW_ALL_MODE_ID,
+      availableModes: COPILOT_MODES,
+      configOptions: [
+        copilotModeConfigOption(COPILOT_ALLOW_ALL_MODE_ID),
+        copilotAllowAllConfigOption("on"),
+      ],
+      connection: { setSessionConfigOption, setSessionMode },
+    });
+
+    await session.setMode("https://agentclientprotocol.com/protocol/session-modes#agent");
+
+    expect(setSessionConfigOption).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      configId: "allow_all",
+      value: "off",
+    });
+    expect(setSessionMode).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      modeId: "https://agentclientprotocol.com/protocol/session-modes#agent",
+    });
+  });
+
+  test("trusts Copilot allow_all config updates as the current mode source", async () => {
+    const session = createCopilotSessionWithConfig();
+    const internals = asInternals<ACPSessionInternals>(session);
+
+    const events = internals.translateSessionUpdate({
+      sessionUpdate: "config_option_update",
+      configOptions: [
+        copilotModeConfigOption("https://agentclientprotocol.com/protocol/session-modes#agent"),
+        copilotAllowAllConfigOption("on"),
+      ],
+    });
+
+    expect(events).toMatchObject([
+      {
+        type: "mode_changed",
+        provider: "copilot",
+        currentModeId: COPILOT_ALLOW_ALL_MODE_ID,
+        availableModes: expect.arrayContaining([
+          expect.objectContaining({ id: COPILOT_ALLOW_ALL_MODE_ID, label: "Allow All" }),
+        ]),
+      },
+    ]);
+    await expect(session.getCurrentMode()).resolves.toBe(COPILOT_ALLOW_ALL_MODE_ID);
   });
 });
 
@@ -1380,5 +1580,80 @@ describe("ACPAgentSession", () => {
       error: "prompt failed",
     });
     expect(asInternals<ACPSessionInternals>(session).activeForegroundTurnId).toBeNull();
+  });
+
+  test("startTurn preserves JSON-RPC error details from a real ACP prompt response", async () => {
+    const session = createSession();
+    const clientToAgent = new TransformStream();
+    const agentToClient = new TransformStream();
+    const upstreamMessage =
+      "Authentication failed: Please authenticate to continue. Run `/login` to log in.";
+    const upstreamData = {
+      cause: "auth_required",
+      errorMessage: "Please authenticate to continue. Run `/login` to log in.",
+    };
+    const agent: Agent = {
+      async initialize() {
+        return {
+          protocolVersion: PROTOCOL_VERSION,
+          agentCapabilities: {},
+          authMethods: [{ id: "windsurf-api-key", name: "API Key" }],
+        };
+      },
+      async newSession() {
+        return { sessionId: "session-1" };
+      },
+      async prompt() {
+        throw new RequestError(-32000, upstreamMessage, upstreamData);
+      },
+      async authenticate() {},
+      async cancel() {},
+    };
+    const agentConnection = new AgentSideConnection(
+      () => agent,
+      ndJsonStream(agentToClient.writable, clientToAgent.readable),
+    );
+    const connection = new ClientSideConnection(
+      () => ({
+        async requestPermission() {
+          return { outcome: { outcome: "cancelled" } };
+        },
+        async sessionUpdate() {},
+      }),
+      ndJsonStream(clientToAgent.writable, agentToClient.readable),
+    );
+    await connection.initialize({
+      protocolVersion: PROTOCOL_VERSION,
+      clientCapabilities: {},
+      clientInfo: { name: "Paseo test", version: "dev" },
+    });
+    expect(agentConnection.signal.aborted).toBe(false);
+    const sessionResponse = await connection.newSession({
+      cwd: "/tmp/paseo-acp-test",
+      mcpServers: [],
+    });
+    const turnFailed = new Promise<Extract<AgentStreamEvent, { type: "turn_failed" }>>(
+      (resolve) => {
+        session.subscribe((event) => {
+          if (event.type === "turn_failed") {
+            resolve(event);
+          }
+        });
+      },
+    );
+
+    asInternals<ACPSessionInternals>(session).sessionId = sessionResponse.sessionId;
+    asInternals<ACPSessionInternals>(session).connection = connection;
+
+    await session.startTurn("hello");
+
+    await expect(turnFailed).resolves.toMatchObject({
+      error: expect.stringContaining(upstreamMessage),
+      code: "-32000",
+      diagnostic: expect.stringContaining("auth_required"),
+    });
+    await expect(turnFailed).resolves.toMatchObject({
+      error: expect.not.stringContaining("[object Object]"),
+    });
   });
 });

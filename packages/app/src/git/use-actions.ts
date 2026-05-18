@@ -11,6 +11,7 @@ import { useToast } from "@/contexts/toast-context";
 import { useSessionStore } from "@/stores/session-store";
 import { resolveWorkspaceIdByExecutionDirectory } from "@/utils/workspace-execution";
 import { buildWorkspaceArchiveRedirectRoute } from "@/utils/workspace-archive-navigation";
+import { confirmRiskyWorktreeArchive } from "@/git/worktree-archive-warning";
 
 export type { GitActionId, GitAction, GitActions } from "@/git/policy";
 
@@ -169,6 +170,11 @@ export function useGitActions({ serverId, cwd, icons }: UseGitActionsInput): Use
     cwd,
     enabled: isGit,
   });
+  const baseRefLabel = useMemo(() => formatBaseRefLabel(baseRef), [baseRef]);
+  const branchLabel = resolveBranchLabel({
+    currentBranch: gitStatus?.currentBranch,
+    notGit,
+  });
 
   // Ship default persistence
   const shipDefaultStorageKey = useMemo(() => {
@@ -240,6 +246,20 @@ export function useGitActions({ serverId, cwd, icons }: UseGitActionsInput): Use
       s.getStatus({ serverId, cwd, actionId: "merge-pr-rebase" }),
     ),
   };
+  const enablePrAutoMergeStatuses: Record<CheckoutPrMergeMethod, CheckoutGitActionStatus> = {
+    squash: useCheckoutGitActionsStore((s) =>
+      s.getStatus({ serverId, cwd, actionId: "enable-pr-auto-merge-squash" }),
+    ),
+    merge: useCheckoutGitActionsStore((s) =>
+      s.getStatus({ serverId, cwd, actionId: "enable-pr-auto-merge-merge" }),
+    ),
+    rebase: useCheckoutGitActionsStore((s) =>
+      s.getStatus({ serverId, cwd, actionId: "enable-pr-auto-merge-rebase" }),
+    ),
+  };
+  const disablePrAutoMergeStatus = useCheckoutGitActionsStore((s) =>
+    s.getStatus({ serverId, cwd, actionId: "disable-pr-auto-merge" }),
+  );
   const mergeStatus = useCheckoutGitActionsStore((s) =>
     s.getStatus({ serverId, cwd, actionId: "merge-branch" }),
   );
@@ -256,9 +276,14 @@ export function useGitActions({ serverId, cwd, icons }: UseGitActionsInput): Use
   const runPullAndPush = useCheckoutGitActionsStore((s) => s.pullAndPush);
   const runCreatePr = useCheckoutGitActionsStore((s) => s.createPr);
   const runMergePr = useCheckoutGitActionsStore((s) => s.mergePr);
+  const runEnablePrAutoMerge = useCheckoutGitActionsStore((s) => s.enablePrAutoMerge);
+  const runDisablePrAutoMerge = useCheckoutGitActionsStore((s) => s.disablePrAutoMerge);
   const runMergeBranch = useCheckoutGitActionsStore((s) => s.mergeBranch);
   const runMergeFromBase = useCheckoutGitActionsStore((s) => s.mergeFromBase);
   const runArchiveWorktree = useCheckoutGitActionsStore((s) => s.archiveWorktree);
+  const githubAutoMergeActionsEnabled = useSessionStore(
+    (s) => s.sessions[serverId]?.serverInfo?.features?.checkoutGithubSetAutoMerge === true,
+  );
 
   const toastActionError = useCallback(
     (error: unknown, fallback: string) => {
@@ -348,6 +373,32 @@ export function useGitActions({ serverId, cwd, icons }: UseGitActionsInput): Use
     [cwd, persistShipDefault, runMergePr, serverId, toastActionError, toastActionSuccess],
   );
 
+  const handleEnablePrAutoMerge = useCallback(
+    (method: CheckoutPrMergeMethod) => {
+      void persistShipDefault("pr");
+      void runEnablePrAutoMerge({ serverId, cwd, method })
+        .then(() => {
+          toastActionSuccess("Auto-merge enabled");
+          return;
+        })
+        .catch((err) => {
+          toastActionError(err, "Failed to enable auto-merge");
+        });
+    },
+    [cwd, persistShipDefault, runEnablePrAutoMerge, serverId, toastActionError, toastActionSuccess],
+  );
+
+  const handleDisablePrAutoMerge = useCallback(() => {
+    void runDisablePrAutoMerge({ serverId, cwd })
+      .then(() => {
+        toastActionSuccess("Auto-merge disabled");
+        return;
+      })
+      .catch((err) => {
+        toastActionError(err, "Failed to disable auto-merge");
+      });
+  }, [cwd, runDisablePrAutoMerge, serverId, toastActionError, toastActionSuccess]);
+
   const handleMergeBranch = useCallback(() => {
     if (!baseRef) {
       toast.error("Base ref unavailable");
@@ -389,31 +440,59 @@ export function useGitActions({ serverId, cwd, icons }: UseGitActionsInput): Use
       });
   }, [baseRef, cwd, runMergeFromBase, serverId, toast, toastActionError, toastActionSuccess]);
 
-  const handleArchiveWorktree = useCallback(() => {
+  const archiveWorktreeAfterConfirmation = useCallback(async () => {
     const worktreePath = status?.cwd;
     if (!worktreePath) {
       toast.error("Worktree path unavailable");
       return;
     }
+
     const workspaces = useSessionStore.getState().sessions[serverId]?.workspaces;
+    const workspaceList = Array.from(workspaces?.values() ?? []);
+    const workspace = workspaceList.find(
+      (candidate) => candidate.workspaceDirectory === worktreePath,
+    );
+    const confirmed = await confirmRiskyWorktreeArchive({
+      worktreeName: workspace?.name ?? branchLabel,
+      isDirty: gitStatus?.isDirty,
+      aheadOfOrigin: gitStatus?.aheadOfOrigin,
+      diffStat: workspace?.diffStat ?? null,
+    });
+    if (!confirmed) {
+      return;
+    }
+
     const archivedWorkspaceId =
       resolveWorkspaceIdByExecutionDirectory({
-        workspaces: workspaces?.values(),
+        workspaces: workspaceList,
         workspaceDirectory: worktreePath,
       }) ?? worktreePath;
     router.replace(
       buildWorkspaceArchiveRedirectRoute({
         serverId,
         archivedWorkspaceId,
-        workspaces: workspaces?.values() ?? [],
+        workspaces: workspaceList,
       }) as Href,
     );
     void runArchiveWorktree({ serverId, cwd, worktreePath }).catch((err) => {
       toastActionError(err, "Failed to archive worktree");
     });
-  }, [cwd, runArchiveWorktree, serverId, status, toast, toastActionError]);
+  }, [
+    branchLabel,
+    cwd,
+    gitStatus?.aheadOfOrigin,
+    gitStatus?.isDirty,
+    runArchiveWorktree,
+    serverId,
+    status?.cwd,
+    toast,
+    toastActionError,
+  ]);
 
-  const baseRefLabel = useMemo(() => formatBaseRefLabel(baseRef), [baseRef]);
+  const handleArchiveWorktree = useCallback(() => {
+    void archiveWorktreeAfterConfirmation();
+  }, [archiveWorktreeAfterConfirmation]);
+
   const derived = deriveGitActionsState({
     isGit,
     status,
@@ -437,11 +516,6 @@ export function useGitActions({ serverId, cwd, icons }: UseGitActionsInput): Use
     shouldPromoteArchive,
   } = derived;
 
-  const branchLabel = resolveBranchLabel({
-    currentBranch: gitStatus?.currentBranch,
-    notGit,
-  });
-
   const handlePrAction = useCallback(() => {
     if (prStatus?.url) {
       openURLInNewTab(prStatus.url);
@@ -455,12 +529,14 @@ export function useGitActions({ serverId, cwd, icons }: UseGitActionsInput): Use
     return buildGitActions({
       isGit,
       githubFeaturesEnabled,
+      githubAutoMergeActionsEnabled,
       hasPullRequest,
       pullRequestUrl: prStatus?.url ?? null,
       pullRequestState: narrowPullRequestState(prStatus?.state),
       pullRequestIsDraft: prStatus?.isDraft ?? false,
       pullRequestIsMerged: prStatus?.isMerged ?? false,
       pullRequestMergeable: prStatus?.mergeable ?? "UNKNOWN",
+      pullRequestGithub: prStatus?.github ?? null,
       hasRemote,
       isPaseoOwnedWorktree,
       isOnBaseBranch,
@@ -522,6 +598,30 @@ export function useGitActions({ serverId, cwd, icons }: UseGitActionsInput): Use
           icon: icons.mergePrRebase,
           handler: () => handleMergePr("rebase"),
         },
+        "enable-pr-auto-merge-squash": {
+          disabled: isActionDisabled(actionsDisabled, enablePrAutoMergeStatuses.squash),
+          status: enablePrAutoMergeStatuses.squash,
+          icon: icons.mergePrSquash,
+          handler: () => handleEnablePrAutoMerge("squash"),
+        },
+        "enable-pr-auto-merge-merge": {
+          disabled: isActionDisabled(actionsDisabled, enablePrAutoMergeStatuses.merge),
+          status: enablePrAutoMergeStatuses.merge,
+          icon: icons.mergePrMerge,
+          handler: () => handleEnablePrAutoMerge("merge"),
+        },
+        "enable-pr-auto-merge-rebase": {
+          disabled: isActionDisabled(actionsDisabled, enablePrAutoMergeStatuses.rebase),
+          status: enablePrAutoMergeStatuses.rebase,
+          icon: icons.mergePrRebase,
+          handler: () => handleEnablePrAutoMerge("rebase"),
+        },
+        "disable-pr-auto-merge": {
+          disabled: isActionDisabled(actionsDisabled, disablePrAutoMergeStatus),
+          status: disablePrAutoMergeStatus,
+          icon: icons.viewPr,
+          handler: handleDisablePrAutoMerge,
+        },
         "merge-branch": {
           disabled: isActionDisabled(actionsDisabled, mergeStatus),
           status: mergeStatus,
@@ -551,11 +651,13 @@ export function useGitActions({ serverId, cwd, icons }: UseGitActionsInput): Use
     prStatus?.isDraft,
     prStatus?.isMerged,
     prStatus?.mergeable,
+    prStatus?.github,
     aheadCount,
     behindBaseCount,
     isPaseoOwnedWorktree,
     isOnBaseBranch,
     githubFeaturesEnabled,
+    githubAutoMergeActionsEnabled,
     hasUncommittedChanges,
     aheadOfOrigin,
     behindOfOrigin,
@@ -571,6 +673,10 @@ export function useGitActions({ serverId, cwd, icons }: UseGitActionsInput): Use
     mergePrStatuses.squash,
     mergePrStatuses.merge,
     mergePrStatuses.rebase,
+    enablePrAutoMergeStatuses.squash,
+    enablePrAutoMergeStatuses.merge,
+    enablePrAutoMergeStatuses.rebase,
+    disablePrAutoMergeStatus,
     mergeStatus,
     mergeFromBaseStatus,
     archiveStatus,
@@ -580,6 +686,8 @@ export function useGitActions({ serverId, cwd, icons }: UseGitActionsInput): Use
     handlePullAndPush,
     handlePrAction,
     handleMergePr,
+    handleEnablePrAutoMerge,
+    handleDisablePrAutoMerge,
     handleMergeBranch,
     handleMergeFromBase,
     handleArchiveWorktree,

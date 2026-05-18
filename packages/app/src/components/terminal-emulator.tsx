@@ -17,6 +17,7 @@ import { useDOMImperativeHandle, type DOMImperativeFactory } from "expo/dom";
 import "@xterm/xterm/css/xterm.css";
 import type { ITheme } from "@xterm/xterm";
 import type { TerminalState } from "@server/shared/messages";
+import type { TerminalInputModeState } from "@server/shared/terminal-input-mode";
 import type { PendingTerminalModifiers } from "../utils/terminal-keys";
 import { TerminalEmulatorRuntime } from "../terminal/runtime/terminal-emulator-runtime";
 import type { TerminalRendererReadyChange } from "../utils/terminal-renderer-readiness";
@@ -115,6 +116,7 @@ interface TerminalEmulatorProps {
   streamKey: string;
   testId?: string;
   xtermTheme?: ITheme;
+  scrollbackLines: number;
   swipeGesturesEnabled?: boolean;
   onSwipeLeft?: () => void;
   onSwipeRight?: () => void;
@@ -129,6 +131,7 @@ interface TerminalEmulatorProps {
     meta: boolean;
   }) => Promise<void> | void;
   onPendingModifiersConsumed?: () => Promise<void> | void;
+  onInputModeChange?: (state: TerminalInputModeState) => Promise<void> | void;
   onRendererReadyChange?: (change: TerminalRendererReadyChange) => void;
   pendingModifiers?: PendingTerminalModifiers;
   focusRequestToken?: number;
@@ -186,6 +189,7 @@ export default function TerminalEmulator({
     foreground: "#e6e6e6",
     cursor: "#e6e6e6",
   },
+  scrollbackLines,
   swipeGesturesEnabled = false,
   onSwipeLeft,
   onSwipeRight,
@@ -194,6 +198,7 @@ export default function TerminalEmulator({
   onResize,
   onTerminalKey,
   onPendingModifiersConsumed,
+  onInputModeChange,
   onRendererReadyChange,
   pendingModifiers = { ctrl: false, shift: false, alt: false },
   focusRequestToken = 0,
@@ -203,6 +208,8 @@ export default function TerminalEmulator({
   const hostRef = useRef<HTMLDivElement | null>(null);
   const runtimeRef = useRef<TerminalEmulatorRuntime | null>(null);
   const mountedThemeRef = useRef<ITheme>(xtermTheme);
+  const scrollbackLinesRef = useRef(scrollbackLines);
+  scrollbackLinesRef.current = scrollbackLines;
   const viewportRef = useRef<HTMLElement | null>(null);
   const dragStartOffsetRef = useRef(0);
   const dragStartClientYRef = useRef(0);
@@ -219,12 +226,14 @@ export default function TerminalEmulator({
     onResize,
     onTerminalKey,
     onPendingModifiersConsumed,
+    onInputModeChange,
   });
   mountCallbacksRef.current = {
     onInput,
     onResize,
     onTerminalKey,
     onPendingModifiersConsumed,
+    onInputModeChange,
   };
   const initialSnapshotRef = useRef(initialSnapshot);
   initialSnapshotRef.current = initialSnapshot;
@@ -283,6 +292,10 @@ export default function TerminalEmulator({
     mountedThemeRef.current = nextTheme;
     runtimeRef.current?.setTheme({ theme: nextTheme });
   }, [themeKey]);
+
+  useEffect(() => {
+    runtimeRef.current?.setScrollback({ lines: scrollbackLines });
+  }, [scrollbackLines]);
 
   useEffect(() => {
     ensureTerminalScrollbarStyle();
@@ -424,6 +437,7 @@ export default function TerminalEmulator({
       root,
       host,
       initialSnapshot: initialSnapshotRef.current,
+      scrollback: scrollbackLinesRef.current,
       theme: mountedThemeRef.current,
     });
     onRendererReadyChangeRef.current?.({ streamKey, isReady: true });
@@ -444,10 +458,11 @@ export default function TerminalEmulator({
         onResize,
         onTerminalKey,
         onPendingModifiersConsumed,
+        onInputModeChange,
         onOpenExternalUrl: openExternalUrl,
       },
     });
-  }, [onInput, onPendingModifiersConsumed, onResize, onTerminalKey]);
+  }, [onInput, onInputModeChange, onPendingModifiersConsumed, onResize, onTerminalKey]);
 
   useEffect(() => {
     runtimeRef.current?.setPendingModifiers({ pendingModifiers });

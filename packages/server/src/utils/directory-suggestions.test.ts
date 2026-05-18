@@ -227,6 +227,80 @@ describe("searchWorkspaceEntries", () => {
     expect(filesOnly).toEqual([{ path: "README.md", kind: "file" }]);
   });
 
+  it("supports fuzzy basename queries for nested workspace files", async () => {
+    writeFileSync(path.join(workspaceDir, "src", "components", "message-renderer.tsx"), "");
+
+    const results = await searchWorkspaceEntries({
+      cwd: workspaceDir,
+      query: "msgrndr",
+      limit: 20,
+      includeFiles: true,
+      includeDirectories: false,
+    });
+
+    expect(results).toEqual([
+      {
+        path: "src/components/message-renderer.tsx",
+        kind: "file",
+      },
+    ]);
+  });
+
+  it("ranks fuzzy basename matches after exact, prefix, and substring matches", async () => {
+    writeFileSync(path.join(workspaceDir, "src", "components", "msgrndr"), "");
+    writeFileSync(path.join(workspaceDir, "src", "components", "msgrndr-panel.tsx"), "");
+    writeFileSync(path.join(workspaceDir, "src", "components", "use-msgrndr.ts"), "");
+    writeFileSync(path.join(workspaceDir, "src", "components", "message-renderer.tsx"), "");
+
+    const results = await searchWorkspaceEntries({
+      cwd: workspaceDir,
+      query: "msgrndr",
+      limit: 20,
+      includeFiles: true,
+      includeDirectories: false,
+    });
+
+    expect(results.map((entry) => entry.path)).toEqual([
+      "src/components/msgrndr",
+      "src/components/msgrndr-panel.tsx",
+      "src/components/use-msgrndr.ts",
+      "src/components/message-renderer.tsx",
+    ]);
+  });
+
+  it("suffix mode matches whole path segment suffixes without fuzzy matches", async () => {
+    mkdirSync(path.join(workspaceDir, "packages", "app", "src"), { recursive: true });
+    writeFileSync(path.join(workspaceDir, "src", "file.ts"), "");
+    writeFileSync(path.join(workspaceDir, "packages", "app", "src", "file.ts"), "");
+    writeFileSync(path.join(workspaceDir, "src", "paseo-config-file.ts"), "");
+
+    const basenameResults = await searchWorkspaceEntries({
+      cwd: workspaceDir,
+      query: "file.ts",
+      limit: 20,
+      includeFiles: true,
+      includeDirectories: false,
+      matchMode: "suffix",
+    });
+    const suffixResults = await searchWorkspaceEntries({
+      cwd: workspaceDir,
+      query: "src/file.ts",
+      limit: 20,
+      includeFiles: true,
+      includeDirectories: false,
+      matchMode: "suffix",
+    });
+
+    expect(basenameResults).toEqual([
+      { path: "src/file.ts", kind: "file" },
+      { path: "packages/app/src/file.ts", kind: "file" },
+    ]);
+    expect(suffixResults).toEqual([
+      { path: "src/file.ts", kind: "file" },
+      { path: "packages/app/src/file.ts", kind: "file" },
+    ]);
+  });
+
   // POSIX-only: creates and follows a symlink escape fixture.
   it.skipIf(isWindows)(
     "supports path-style queries and does not escape cwd through symlinks",

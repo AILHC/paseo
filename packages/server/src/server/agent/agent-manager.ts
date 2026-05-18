@@ -10,30 +10,31 @@ import type { Logger } from "pino";
 import { z } from "zod";
 import type { TerminalManager } from "../../terminal/terminal-manager.js";
 
-import type {
-  AgentCapabilityFlags,
-  AgentClient,
-  AgentCreateSessionOptions,
-  AgentFeature,
-  AgentLaunchContext,
-  AgentSlashCommand,
-  AgentMode,
-  AgentPermissionRequest,
-  AgentPermissionResponse,
-  AgentPermissionResult,
-  AgentPersistenceHandle,
-  AgentPromptInput,
-  AgentProvider,
-  AgentRunOptions,
-  AgentRunResult,
-  AgentSession,
-  AgentSessionConfig,
-  AgentStreamEvent,
-  AgentTimelineItem,
-  AgentUsage,
-  AgentRuntimeInfo,
-  ListPersistedAgentsOptions,
-  PersistedAgentDescriptor,
+import {
+  getAgentStreamEventTurnId,
+  type AgentCapabilityFlags,
+  type AgentClient,
+  type AgentCreateSessionOptions,
+  type AgentFeature,
+  type AgentLaunchContext,
+  type AgentSlashCommand,
+  type AgentMode,
+  type AgentPermissionRequest,
+  type AgentPermissionResponse,
+  type AgentPermissionResult,
+  type AgentPersistenceHandle,
+  type AgentPromptInput,
+  type AgentProvider,
+  type AgentRunOptions,
+  type AgentRunResult,
+  type AgentSession,
+  type AgentSessionConfig,
+  type AgentStreamEvent,
+  type AgentTimelineItem,
+  type AgentUsage,
+  type AgentRuntimeInfo,
+  type ListPersistedAgentsOptions,
+  type PersistedAgentDescriptor,
 } from "./agent-sdk-types.js";
 import { buildArchivedAgentRecord, type ArchivedStoredAgentRecord } from "./agent-archive.js";
 import type { StoredAgentRecord, AgentStorage } from "./agent-storage.js";
@@ -121,6 +122,7 @@ export type AgentManagerEvent =
       event: AgentStreamEvent;
       seq?: number;
       epoch?: string;
+      timestamp?: string;
     };
 
 export type AgentSubscriber = (event: AgentManagerEvent) => void;
@@ -654,13 +656,14 @@ export class AgentManager {
   async findPersistedAgent(
     provider: AgentProvider,
     sessionId: string,
+    options?: Pick<ListPersistedAgentsOptions, "cwd">,
   ): Promise<PersistedAgentDescriptor | null> {
     const client = this.requireClient(provider);
     if (!client.listPersistedAgents) {
       return null;
     }
 
-    const descriptors = await client.listPersistedAgents({ limit: 200 });
+    const descriptors = await client.listPersistedAgents({ limit: 200, cwd: options?.cwd });
     return (
       descriptors.find((descriptor) => {
         return (
@@ -712,6 +715,10 @@ export class AgentManager {
       );
     }
 
+    if (client.listCommands) {
+      return await client.listCommands(normalizedConfig);
+    }
+
     const session = await client.createSession(normalizedConfig);
     try {
       if (!session.listCommands) {
@@ -740,6 +747,10 @@ export class AgentManager {
       throw new Error(
         `Provider '${normalizedConfig.provider}' is not available. Please ensure the CLI is installed.`,
       );
+    }
+
+    if (client.listFeatures) {
+      return await client.listFeatures(normalizedConfig);
     }
 
     const session = await client.createSession(normalizedConfig);
@@ -1005,18 +1016,28 @@ export class AgentManager {
     this.logger.trace(
       {
         agentId,
+        provider: agent.provider,
+        sessionId: agent.persistence?.sessionId ?? undefined,
+        turnId: agent.activeForegroundTurnId ?? undefined,
         lifecycle: agent.lifecycle,
         activeForegroundTurnId: agent.activeForegroundTurnId,
         pendingPermissions: agent.pendingPermissions.size,
       },
-      "closeAgent: start",
+      "agent.manager.close.start",
     );
     const closedAgent = this.prepareAgentForClosure(agent, "agent closed");
     await agent.session.close();
     this.timelineStore.delete(agentId);
     await this.persistSnapshot(closedAgent);
     this.emitClosedAgent(closedAgent, { persist: false });
-    this.logger.trace({ agentId }, "closeAgent: completed");
+    this.logger.trace(
+      {
+        agentId,
+        provider: closedAgent.provider,
+        sessionId: closedAgent.persistence?.sessionId ?? undefined,
+      },
+      "agent.manager.close.complete",
+    );
   }
 
   async archiveAgent(agentId: string): Promise<{ archivedAt: string }> {
@@ -1380,10 +1401,11 @@ export class AgentManager {
         this.dispatchStream(agent.id, event, {
           seq: row.seq,
           epoch: this.timelineStore.getEpoch(agent.id),
+          timestamp: row.timestamp,
         });
         return;
       }
-      this.dispatchStream(agent.id, event);
+      this.dispatchStream(agent.id, event, { timestamp: new Date().toISOString() });
     };
     void (async () => {
       try {
@@ -1425,6 +1447,7 @@ export class AgentManager {
       {
         seq: row.seq,
         epoch: this.timelineStore.getEpoch(agentId),
+        timestamp: row.timestamp,
       },
     );
     if (options?.emitState !== false) {
@@ -1446,6 +1469,7 @@ export class AgentManager {
       {
         seq: row.seq,
         epoch: this.timelineStore.getEpoch(agentId),
+        timestamp: row.timestamp,
       },
     );
     await this.persistSnapshot(agent);
@@ -1470,22 +1494,28 @@ export class AgentManager {
     this.logger.trace(
       {
         agentId,
+        provider: existingAgent.provider,
+        sessionId: existingAgent.persistence?.sessionId ?? undefined,
+        turnId: existingAgent.activeForegroundTurnId ?? undefined,
         lifecycle: existingAgent.lifecycle,
         activeForegroundTurnId: existingAgent.activeForegroundTurnId,
         hasPendingForegroundRun: this.foregroundRuns.hasPendingRun(agentId),
         promptType: typeof prompt === "string" ? "string" : "structured",
         hasRunOptions: Boolean(options),
       },
-      "streamAgent: requested",
+      "agent.manager.stream.request",
     );
     if (existingAgent.activeForegroundTurnId || this.foregroundRuns.hasPendingRun(agentId)) {
       this.logger.trace(
         {
           agentId,
+          provider: existingAgent.provider,
+          sessionId: existingAgent.persistence?.sessionId ?? undefined,
+          turnId: existingAgent.activeForegroundTurnId ?? undefined,
           lifecycle: existingAgent.lifecycle,
           hasPendingForegroundRun: this.foregroundRuns.hasPendingRun(agentId),
         },
-        "streamAgent: rejected because a foreground run is already in flight",
+        "agent.manager.stream.reject",
       );
       throw new Error(`Agent ${agentId} already has an active run`);
     }
@@ -1522,10 +1552,13 @@ export class AgentManager {
       this.logger.trace(
         {
           agentId,
+          provider: agent.provider,
+          sessionId: agent.persistence?.sessionId ?? undefined,
+          turnId,
           lifecycle: agent.lifecycle,
           activeForegroundTurnId: agent.activeForegroundTurnId,
         },
-        "streamAgent: started",
+        "agent.manager.stream.start",
       );
 
       turnStream = this.foregroundRuns.createTurnStream(turnId);
@@ -1577,11 +1610,14 @@ export class AgentManager {
     this.logger.trace(
       {
         agentId: agent.id,
+        provider: agent.provider,
+        sessionId: mutableAgent.persistence?.sessionId ?? undefined,
+        turnId,
         lifecycle: mutableAgent.lifecycle,
         terminalError,
         pendingReplacement: mutableAgent.pendingReplacement,
       },
-      "finalizeForegroundTurn: applying terminal state",
+      "agent.manager.finalize",
     );
     if (!shouldHoldBusyForReplacement) {
       this.touchUpdatedAt(mutableAgent);
@@ -1763,7 +1799,7 @@ export class AgentManager {
       const bufferedResolution = agent.bufferedPermissionResolutions.get(requestId);
       if (bufferedResolution) {
         agent.bufferedPermissionResolutions.delete(requestId);
-        this.dispatchStream(agent.id, bufferedResolution);
+        this.dispatchStream(agent.id, bufferedResolution, { timestamp: new Date().toISOString() });
       }
 
       return result;
@@ -1853,12 +1889,16 @@ export class AgentManager {
     // Clear any pending permissions that weren't cleaned up by handleStreamEvent.
     if (agent.pendingPermissions.size > 0) {
       for (const [requestId] of agent.pendingPermissions) {
-        this.dispatchStream(agent.id, {
-          type: "permission_resolved",
-          provider: agent.provider,
-          requestId,
-          resolution: { behavior: "deny", message: "Interrupted" },
-        });
+        this.dispatchStream(
+          agent.id,
+          {
+            type: "permission_resolved",
+            provider: agent.provider,
+            requestId,
+            resolution: { behavior: "deny", message: "Interrupted" },
+          },
+          { timestamp: new Date().toISOString() },
+        );
       }
       agent.pendingPermissions.clear();
       this.touchUpdatedAt(agent);
@@ -2371,6 +2411,16 @@ export class AgentManager {
   }
 
   private enqueueSessionEvent(agentId: string, event: AgentStreamEvent): void {
+    this.logger.trace(
+      {
+        agentId,
+        provider: event.provider,
+        sessionId: this.agents.get(agentId)?.persistence?.sessionId ?? undefined,
+        turnId: getAgentStreamEventTurnId(event),
+        event,
+      },
+      "agent.manager.enqueue",
+    );
     const previous = this.sessionEventTails.get(agentId) ?? Promise.resolve();
     const next = previous
       .catch(() => undefined)
@@ -2382,6 +2432,16 @@ export class AgentManager {
         if (current.session == null) {
           return;
         }
+        this.logger.trace(
+          {
+            agentId,
+            provider: event.provider,
+            sessionId: current.persistence?.sessionId ?? undefined,
+            turnId: getAgentStreamEventTurnId(event),
+            event,
+          },
+          "agent.manager.dequeue",
+        );
         await this.dispatchSessionEvent(current, event);
         return;
       })
@@ -2405,8 +2465,19 @@ export class AgentManager {
     agent: ActiveManagedAgent,
     event: AgentStreamEvent,
   ): Promise<void> {
-    const turnId = (event as { turnId?: string }).turnId;
+    const turnId = getAgentStreamEventTurnId(event);
     const matchingWaiters = this.foregroundRuns.getMatchingWaiters(agent, turnId);
+    this.logger.trace(
+      {
+        agentId: agent.id,
+        provider: event.provider,
+        sessionId: agent.persistence?.sessionId ?? undefined,
+        turnId,
+        matchingWaiterCount: matchingWaiters.length,
+        event,
+      },
+      "agent.manager.dispatch_session_event",
+    );
 
     const shouldNotifyWaiters = await this.handleStreamEvent(agent, event);
 
@@ -2417,6 +2488,18 @@ export class AgentManager {
     this.foregroundRuns.notifyWaiters(matchingWaiters, event, {
       terminal: isTurnTerminalEvent(event),
     });
+    this.logger.trace(
+      {
+        agentId: agent.id,
+        provider: event.provider,
+        sessionId: agent.persistence?.sessionId ?? undefined,
+        turnId,
+        notifiedWaiterCount: matchingWaiters.length,
+        terminal: isTurnTerminalEvent(event),
+        event,
+      },
+      "agent.manager.notify_waiters",
+    );
   }
 
   private async resolveInitialPersistedTitle(
@@ -2521,7 +2604,11 @@ export class AgentManager {
         if (isDuplicateLegacyUserMessage(event.item, canonicalUserMessagesById)) {
           continue;
         }
-        this.recordTimeline(agent.id, event.item);
+        this.recordTimeline(
+          agent.id,
+          event.item,
+          event.timestamp ? { timestamp: event.timestamp } : undefined,
+        );
       }
     } catch {
       // ignore history failures
@@ -2529,7 +2616,7 @@ export class AgentManager {
   }
 
   private notifyForegroundTurnWaiters(agentId: string, event: AgentStreamEvent): void {
-    const turnId = (event as { turnId?: string }).turnId;
+    const turnId = getAgentStreamEventTurnId(event);
     if (turnId == null) {
       return;
     }
@@ -2540,6 +2627,16 @@ export class AgentManager {
     }
 
     this.foregroundRuns.notifyAgentWaiters(agent, event);
+    this.logger.trace(
+      {
+        agentId,
+        provider: event.provider,
+        sessionId: agent.persistence?.sessionId ?? undefined,
+        turnId,
+        event,
+      },
+      "agent.manager.notify_waiters.coalesced",
+    );
   }
 
   private async handleStreamEvent(
@@ -2547,8 +2644,9 @@ export class AgentManager {
     event: AgentStreamEvent,
     options?: HandleStreamEventOptions,
   ): Promise<boolean> {
-    const eventTurnId = (event as { turnId?: string }).turnId;
+    const eventTurnId = getAgentStreamEventTurnId(event);
     const isForegroundEvent = Boolean(eventTurnId && agent.activeForegroundTurnId === eventTurnId);
+    this.traceHandleStreamEventStart(agent, event, eventTurnId, isForegroundEvent);
     if (
       eventTurnId &&
       isTurnTerminalEvent(event) &&
@@ -2561,6 +2659,7 @@ export class AgentManager {
     if (!options?.fromHistory) {
       this.touchUpdatedAt(agent);
       if (this.agentStreamCoalescer.handle(agent.id, event)) {
+        this.traceCoalescerBuffered(agent, event, eventTurnId);
         return false;
       }
       this.agentStreamCoalescer.flushFor(agent.id);
@@ -2585,10 +2684,72 @@ export class AgentManager {
     }
 
     if (!options?.fromHistory && flags.shouldDispatchEvent) {
-      this.dispatchStream(agent.id, event);
+      this.dispatchStream(agent.id, event, { timestamp: new Date().toISOString() });
     }
 
+    this.traceHandleStreamEventEnd(agent, event, eventTurnId, flags);
+
     return flags.shouldNotifyWaiters;
+  }
+
+  private traceHandleStreamEventStart(
+    agent: ActiveManagedAgent,
+    event: AgentStreamEvent,
+    turnId: string | undefined,
+    isForegroundEvent: boolean,
+  ): void {
+    this.logger.trace(
+      {
+        agentId: agent.id,
+        provider: event.provider,
+        sessionId: agent.persistence?.sessionId ?? undefined,
+        turnId,
+        lifecycle: agent.lifecycle,
+        activeForegroundTurnId: agent.activeForegroundTurnId,
+        isForegroundEvent,
+        event,
+      },
+      "agent.manager.handle_stream_event.start",
+    );
+  }
+
+  private traceCoalescerBuffered(
+    agent: ActiveManagedAgent,
+    event: AgentStreamEvent,
+    turnId: string | undefined,
+  ): void {
+    this.logger.trace(
+      {
+        agentId: agent.id,
+        provider: event.provider,
+        sessionId: agent.persistence?.sessionId ?? undefined,
+        turnId,
+        event,
+      },
+      "agent.manager.coalescer.buffer",
+    );
+  }
+
+  private traceHandleStreamEventEnd(
+    agent: ActiveManagedAgent,
+    event: AgentStreamEvent,
+    turnId: string | undefined,
+    flags: StreamEventFlags,
+  ): void {
+    this.logger.trace(
+      {
+        agentId: agent.id,
+        provider: event.provider,
+        sessionId: agent.persistence?.sessionId ?? undefined,
+        turnId,
+        lifecycle: agent.lifecycle,
+        activeForegroundTurnId: agent.activeForegroundTurnId,
+        shouldDispatchEvent: flags.shouldDispatchEvent,
+        shouldNotifyWaiters: flags.shouldNotifyWaiters,
+        event,
+      },
+      "agent.manager.handle_stream_event.end",
+    );
   }
 
   private dispatchStreamEventByType(params: {
@@ -2722,7 +2883,11 @@ export class AgentManager {
     }
 
     if (options?.fromHistory) {
-      this.recordTimeline(agent.id, event.item);
+      this.recordTimeline(
+        agent.id,
+        event.item,
+        event.timestamp ? { timestamp: event.timestamp } : undefined,
+      );
       flags.shouldDispatchEvent = false;
       flags.shouldNotifyWaiters = false;
       return;
@@ -2747,11 +2912,13 @@ export class AgentManager {
     this.logger.trace(
       {
         agentId: agent.id,
+        provider: agent.provider,
+        sessionId: agent.persistence?.sessionId ?? undefined,
+        turnId: eventTurnId,
         lifecycle: agent.lifecycle,
         activeForegroundTurnId: agent.activeForegroundTurnId,
-        eventTurnId,
       },
-      "handleStreamEvent: turn_completed",
+      "agent.manager.turn.completed",
     );
     agent.lastUsage = event.usage;
     agent.lastError = undefined;
@@ -2778,6 +2945,9 @@ export class AgentManager {
     this.logger.warn(
       {
         agentId: agent.id,
+        provider: agent.provider,
+        sessionId: agent.persistence?.sessionId ?? undefined,
+        turnId: eventTurnId,
         lifecycle: agent.lifecycle,
         activeForegroundTurnId: agent.activeForegroundTurnId,
         eventTurnId,
@@ -2818,11 +2988,14 @@ export class AgentManager {
     this.logger.trace(
       {
         agentId: agent.id,
+        provider: agent.provider,
+        sessionId: agent.persistence?.sessionId ?? undefined,
+        turnId: eventTurnId,
         lifecycle: agent.lifecycle,
         activeForegroundTurnId: agent.activeForegroundTurnId,
         eventTurnId,
       },
-      "handleStreamEvent: turn_canceled",
+      "agent.manager.turn.canceled",
     );
     if (!isForegroundEvent && !agent.pendingReplacement) {
       agent.lifecycle = "idle";
@@ -2843,11 +3016,13 @@ export class AgentManager {
     this.logger.trace(
       {
         agentId: agent.id,
+        provider: agent.provider,
+        sessionId: agent.persistence?.sessionId ?? undefined,
+        turnId: eventTurnId,
         lifecycle: agent.lifecycle,
         activeForegroundTurnId: agent.activeForegroundTurnId,
-        eventTurnId,
       },
-      "handleStreamEvent: turn_started",
+      "agent.manager.turn.started",
     );
     if (!isForegroundEvent) {
       agent.lifecycle = "running";
@@ -2918,6 +3093,7 @@ export class AgentManager {
     this.dispatchStream(agentId, event, {
       seq: row.seq,
       epoch: this.timelineStore.getEpoch(agentId),
+      timestamp: row.timestamp,
     });
     return event;
   }
@@ -2958,6 +3134,7 @@ export class AgentManager {
       {
         seq: row.seq,
         epoch: this.timelineStore.getEpoch(agent.id),
+        timestamp: row.timestamp,
       },
     );
   }
@@ -2978,8 +3155,12 @@ export class AgentManager {
     return parts.join("\n\n");
   }
 
-  private recordTimeline(agentId: string, item: AgentTimelineItem): AgentTimelineRow {
-    const row = this.timelineStore.append(agentId, item);
+  private recordTimeline(
+    agentId: string,
+    item: AgentTimelineItem,
+    options?: { timestamp?: string },
+  ): AgentTimelineRow {
+    const row = this.timelineStore.append(agentId, item, options);
     this.enqueueDurableTimelineAppend(agentId, row);
     return row;
   }
@@ -2992,6 +3173,20 @@ export class AgentManager {
     }
 
     this.syncFeaturesFromSession(agent);
+
+    this.logger.trace(
+      {
+        agentId: agent.id,
+        provider: agent.provider,
+        sessionId: agent.persistence?.sessionId ?? undefined,
+        turnId: agent.activeForegroundTurnId ?? undefined,
+        lifecycle: agent.lifecycle,
+        activeForegroundTurnId: agent.activeForegroundTurnId,
+        pendingPermissions: agent.pendingPermissions.size,
+        persist: options?.persist !== false,
+      },
+      "agent.manager.emit_state",
+    );
 
     this.dispatch({
       type: "agent_state",
@@ -3118,8 +3313,20 @@ export class AgentManager {
   private dispatchStream(
     agentId: string,
     event: AgentStreamEvent,
-    metadata?: { seq?: number; epoch?: string },
+    metadata?: { seq?: number; epoch?: string; timestamp?: string },
   ): void {
+    const agent = this.agents.get(agentId);
+    this.logger.trace(
+      {
+        agentId,
+        provider: event.provider,
+        sessionId: agent?.persistence?.sessionId ?? undefined,
+        turnId: getAgentStreamEventTurnId(event),
+        metadata,
+        event,
+      },
+      "agent.manager.dispatch_stream",
+    );
     this.dispatch({ type: "agent_stream", agentId, event, ...metadata });
   }
 
@@ -3215,6 +3422,7 @@ export class AgentManager {
 
   private buildLaunchContext(agentId: string): AgentLaunchContext {
     return {
+      agentId,
       env: {
         PASEO_AGENT_ID: agentId,
       },

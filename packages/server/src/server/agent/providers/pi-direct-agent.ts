@@ -30,29 +30,30 @@ import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
 import type { Api, ImageContent, Model, TextContent } from "@mariozechner/pi-ai";
 import { z } from "zod";
 
-import type {
-  AgentCapabilityFlags,
-  AgentClient,
-  AgentLaunchContext,
-  AgentMetadata,
-  AgentMode,
-  AgentModelDefinition,
-  AgentPermissionRequest,
-  AgentPermissionResponse,
-  AgentPersistenceHandle,
-  AgentPromptInput,
-  AgentRunOptions,
-  AgentRunResult,
-  AgentRuntimeInfo,
-  AgentSession,
-  AgentSessionConfig,
-  AgentSlashCommand,
-  AgentStreamEvent,
-  AgentTimelineItem,
-  AgentUsage,
-  ListModesOptions,
-  ListModelsOptions,
-  ToolCallDetail,
+import {
+  getAgentStreamEventTurnId,
+  type AgentCapabilityFlags,
+  type AgentClient,
+  type AgentLaunchContext,
+  type AgentMetadata,
+  type AgentMode,
+  type AgentModelDefinition,
+  type AgentPermissionRequest,
+  type AgentPermissionResponse,
+  type AgentPersistenceHandle,
+  type AgentPromptInput,
+  type AgentRunOptions,
+  type AgentRunResult,
+  type AgentRuntimeInfo,
+  type AgentSession,
+  type AgentSessionConfig,
+  type AgentSlashCommand,
+  type AgentStreamEvent,
+  type AgentTimelineItem,
+  type AgentUsage,
+  type ListModesOptions,
+  type ListModelsOptions,
+  type ToolCallDetail,
 } from "../agent-sdk-types.js";
 import type { ProviderRuntimeSettings } from "../provider-launch-config.js";
 import { renderPromptAttachmentAsText } from "../prompt-attachments.js";
@@ -64,6 +65,7 @@ import {
   resolveBinaryVersion,
   toDiagnosticErrorMessage,
 } from "./diagnostic-utils.js";
+import { applyPiSessionRecoveryPolicy } from "./pi-session-recovery-policy.js";
 
 const PI_PROVIDER = "pi";
 const DEFAULT_PI_THINKING_LEVEL: ThinkingLevel = "medium";
@@ -115,6 +117,7 @@ export type PiDirectSessionAdapter = Pick<
   PiAgentSession,
   | "abort"
   | "agent"
+  | "compact"
   | "dispose"
   | "extensionRunner"
   | "getSessionStats"
@@ -738,21 +741,6 @@ function parsePersistenceMetadata(metadata: AgentMetadata | undefined): PiPersis
   return {};
 }
 
-function getStreamEventTurnId(event: AgentStreamEvent): string | undefined {
-  switch (event.type) {
-    case "turn_started":
-    case "turn_completed":
-    case "turn_failed":
-    case "turn_canceled":
-    case "timeline":
-    case "permission_requested":
-    case "permission_resolved":
-      return event.turnId;
-    default:
-      return undefined;
-  }
-}
-
 function isPiRequestAbortError(error: unknown): boolean {
   if (error instanceof Error && error.name === "AbortError") {
     return true;
@@ -1045,7 +1033,7 @@ export class PiDirectAgentSession implements AgentSession {
         return;
       }
 
-      const eventTurnId = getStreamEventTurnId(event);
+      const eventTurnId = getAgentStreamEventTurnId(event);
       if (turnId && eventTurnId && eventTurnId !== turnId) {
         return;
       }
@@ -1109,6 +1097,19 @@ export class PiDirectAgentSession implements AgentSession {
     const payload = convertPromptInput(prompt);
     const turnId = randomUUID();
     this.activeTurnId = turnId;
+
+    try {
+      await applyPiSessionRecoveryPolicy(this.session);
+    } catch (error) {
+      this.activeTurnId = null;
+      this.emit({
+        type: "turn_failed",
+        provider: PI_PROVIDER,
+        turnId,
+        error: toDiagnosticErrorMessage(error),
+      });
+      return { turnId };
+    }
 
     void this.session
       .prompt(payload.text, payload.images ? { images: payload.images } : undefined)

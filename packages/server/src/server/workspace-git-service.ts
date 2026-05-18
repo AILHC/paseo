@@ -22,6 +22,7 @@ import {
 } from "../utils/checkout-git.js";
 import {
   createGitHubService,
+  type GitHubPullRequestStatusFacts,
   type GitHubService,
   type PullRequestMergeable,
 } from "../services/github-service.js";
@@ -92,6 +93,7 @@ export interface WorkspaceGitRuntimeSnapshot {
       }>;
       checksStatus?: "none" | "pending" | "success" | "failure";
       reviewDecision?: "approved" | "changes_requested" | "pending" | null;
+      github?: GitHubPullRequestStatusFacts;
     } | null;
     error: { message: string } | null;
   };
@@ -103,6 +105,7 @@ export interface WorkspaceGitService {
     listener: WorkspaceGitListener,
   ): WorkspaceGitSubscription;
 
+  onSnapshotUpdated(listener: WorkspaceGitSnapshotUpdatedListener): WorkspaceGitSubscription;
   peekSnapshot(cwd: string): WorkspaceGitRuntimeSnapshot | null;
   getCheckout(cwd: string): Promise<ProjectCheckoutLitePayload>;
   getSnapshot(
@@ -151,6 +154,7 @@ export interface WorkspaceGitService {
 }
 
 export type WorkspaceGitListener = (snapshot: WorkspaceGitRuntimeSnapshot) => void;
+export type WorkspaceGitSnapshotUpdatedListener = (snapshot: WorkspaceGitRuntimeSnapshot) => void;
 
 export interface WorkspaceGitSubscription {
   unsubscribe: () => void;
@@ -327,6 +331,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   private readonly logger: pino.Logger;
   private readonly paseoHome: string;
   private readonly deps: WorkspaceGitServiceDependencies;
+  private readonly snapshotUpdatedListeners = new Set<WorkspaceGitSnapshotUpdatedListener>();
   private readonly workspaceTargets = new Map<string, WorkspaceGitTarget>();
   private readonly repoTargets = new Map<string, RepoGitTarget>();
   private readonly workingTreeWatchTargets = new Map<string, WorkingTreeWatchTarget>();
@@ -360,7 +365,6 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     string,
     WorkspaceGitAuxiliaryReadCacheEntry<CheckoutDiffResult>
   >();
-
   constructor(options: WorkspaceGitServiceOptions) {
     this.logger = options.logger.child({ module: "workspace-git-service" });
     this.paseoHome = options.paseoHome;
@@ -389,6 +393,15 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     };
   }
 
+  onSnapshotUpdated(listener: WorkspaceGitSnapshotUpdatedListener): WorkspaceGitSubscription {
+    this.snapshotUpdatedListeners.add(listener);
+    return {
+      unsubscribe: () => {
+        this.snapshotUpdatedListeners.delete(listener);
+      },
+    };
+  }
+
   async getSnapshot(
     cwd: string,
     options?: WorkspaceGitSnapshotOptions,
@@ -408,6 +421,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     try {
       const status = await this.deps.getCheckoutStatus(normalizedCwd, {
         paseoHome: this.paseoHome,
+        logger: this.logger,
       });
       if (!status.isGit) {
         return checkoutLiteFromGitSnapshot(normalizedCwd, {
@@ -658,6 +672,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     }
     this.workingTreeWatchTargets.clear();
     this.workingTreeWatchSetups.clear();
+    this.snapshotUpdatedListeners.clear();
   }
 
   private ensureWorkspaceTarget(cwd: string): WorkspaceGitTarget {
@@ -1324,7 +1339,10 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     request: WorkspaceGitRefreshRequest,
   ): Promise<WorkspaceGitRuntimeSnapshot> {
     if (target.refreshState.status === "in-flight") {
-      if (request.force && !target.refreshState.force) {
+      const needsForcedRefresh = request.force && !target.refreshState.force;
+      const needsGitHubRefresh =
+        request.force && request.includeGitHub && !target.refreshState.includeGitHub;
+      if (needsForcedRefresh || needsGitHubRefresh) {
         target.refreshState.queued = this.mergeQueuedRefresh(target.refreshState.queued, request);
       }
       return target.refreshState.promise;
@@ -1424,10 +1442,12 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     }
 
     const force = queued.force || request.force;
+    const upgradesForce = request.force && !queued.force;
+    const upgradesGitHub = request.includeGitHub && !queued.includeGitHub;
     return {
       force,
       includeGitHub: queued.includeGitHub || request.includeGitHub,
-      reason: request.force && !queued.force ? request.reason : queued.reason,
+      reason: upgradesForce || upgradesGitHub ? request.reason : queued.reason,
       notify: queued.notify || request.notify,
     };
   }
@@ -1472,7 +1492,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     }
 
     const cwd = target.cwd;
-    const context: CheckoutContext = { paseoHome: this.paseoHome };
+    const context: CheckoutContext = { paseoHome: this.paseoHome, logger: this.logger };
     const checkoutStatus = await this.deps.getCheckoutStatus(cwd, context);
     if (!checkoutStatus.isGit) {
       target.latestSnapshotLoadedAtMs = now.getTime();
@@ -1530,11 +1550,21 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       return;
     }
     target.latestFingerprint = fingerprint;
-    if (!options?.notify) {
+    if (!options?.notify || target.listeners.size === 0) {
       return;
     }
     for (const listener of target.listeners) {
       listener(snapshot);
+    }
+    for (const listener of this.snapshotUpdatedListeners) {
+      try {
+        listener(snapshot);
+      } catch (error) {
+        this.logger.warn(
+          { err: error, cwd: snapshot.cwd },
+          "Workspace git snapshot listener threw",
+        );
+      }
     }
   }
 

@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { AgentMode } from "./agent-sdk-types.js";
 
 export type AgentModeColorTier = "safe" | "moderate" | "dangerous" | "planning";
-export type AgentModeIcon = "ShieldCheck" | "ShieldAlert" | "ShieldOff";
+export type AgentModeIcon = "ShieldCheck" | "ShieldAlert" | "ShieldOff" | "ShieldQuestionMark";
 
 export interface AgentModeVisuals {
   icon: AgentModeIcon;
@@ -11,6 +11,7 @@ export interface AgentModeVisuals {
 
 export type AgentProviderModeDefinition = Omit<AgentMode, "icon" | "colorTier"> &
   AgentModeVisuals & {
+    // Marks the provider's most-permissioned no-prompt mode. Selecting it means tools run without approval; the runtime mechanism is provider-specific.
     isUnattended?: boolean;
   };
 
@@ -37,6 +38,13 @@ const CLAUDE_MODES: AgentProviderModeDefinition[] = [
     description: "Prompts for permission the first time a tool is used",
     icon: "ShieldCheck",
     colorTier: "safe",
+  },
+  {
+    id: "auto",
+    label: "Auto mode",
+    description: "Uses a model classifier to review permission prompts automatically",
+    icon: "ShieldQuestionMark",
+    colorTier: "moderate",
   },
   {
     id: "acceptEdits",
@@ -71,6 +79,14 @@ const CODEX_MODES: AgentProviderModeDefinition[] = [
     colorTier: "moderate",
   },
   {
+    id: "auto-review",
+    label: "Auto-review",
+    description:
+      "Same workspace-write permissions as Default, but eligible `on-request` approvals are routed through the auto-reviewer subagent.",
+    icon: "ShieldQuestionMark",
+    colorTier: "moderate",
+  },
+  {
     id: "full-access",
     label: "Full Access",
     description: "Edit files, run commands, and access the network without additional prompts.",
@@ -96,9 +112,9 @@ const COPILOT_MODES: AgentProviderModeDefinition[] = [
     colorTier: "planning",
   },
   {
-    id: "https://agentclientprotocol.com/protocol/session-modes#autopilot",
-    label: "Autopilot",
-    description: "Autonomous mode that runs until task completion without user interaction",
+    id: "allow-all",
+    label: "Allow All",
+    description: "Automatically approves all Copilot tool, path, and URL requests.",
     icon: "ShieldOff",
     colorTier: "dangerous",
     isUnattended: true,

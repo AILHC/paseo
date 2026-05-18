@@ -112,6 +112,9 @@ function createFallbackWorkspaceGitService(): WorkspaceGitService {
     registerWorkspace: () => ({
       unsubscribe: () => {},
     }),
+    onSnapshotUpdated: () => ({
+      unsubscribe: () => {},
+    }),
     peekSnapshot: () => null,
     getCheckout: async (cwd: string) => ({
       cwd,
@@ -878,6 +881,7 @@ export class VoiceAssistantWebSocketServer {
       daemonConfigStore: this.daemonConfigStore,
       mcpBaseUrl: this.mcpBaseUrl,
       stt: () => this.speech?.resolveStt() ?? null,
+      sttLanguage: this.speech?.resolveSttLanguage() ?? "en",
       tts: () => this.speech?.resolveTts() ?? null,
       terminalManager: this.terminalManager,
       providerSnapshotManager: this.providerSnapshotManager,
@@ -910,6 +914,7 @@ export class VoiceAssistantWebSocketServer {
           ? {
               finalTimeoutMs: this.dictation?.finalTimeoutMs,
               stt: () => this.speech?.resolveDictationStt() ?? null,
+              sttLanguage: this.speech?.resolveDictationSttLanguage() ?? "en",
               getSpeechReadiness: () => this.speech!.getReadiness(),
             }
           : undefined,
@@ -1046,6 +1051,8 @@ export class VoiceAssistantWebSocketServer {
       features: {
         // COMPAT(providersSnapshot): keep optional until all clients rely on snapshot flow.
         providersSnapshot: true,
+        // COMPAT(checkoutGithubSetAutoMerge): added in v0.1.75, remove gate after 2026-11-13.
+        checkoutGithubSetAutoMerge: true,
       },
     };
   }

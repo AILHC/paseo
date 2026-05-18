@@ -4,7 +4,6 @@ import { createTestLogger } from "../../../test-utils/test-logger.js";
 import type { AgentStreamEvent } from "../agent-sdk-types.js";
 import { OpenCodeAgentClient } from "./opencode-agent.js";
 import {
-  createEventStream,
   idleEvent,
   TestOpenCodeClient,
   TestOpenCodeRuntime,
@@ -19,7 +18,7 @@ function mockOpenCodeClient(options: MockOpenCodeClientOptions = {}) {
   const runtime = new TestOpenCodeRuntime();
   const openCodeClient = new TestOpenCodeClient();
   openCodeClient.appAgentsResponse = { data: options.agents ?? [] };
-  openCodeClient.eventStream = createEventStream(options.events ?? [idleEvent()]);
+  openCodeClient.sessionPromptAsyncEvents = options.events ?? [idleEvent()];
   runtime.enqueueClient(openCodeClient);
 
   return { openCodeClient, runtime };
@@ -71,7 +70,7 @@ describe("OpenCode full-access mode", () => {
       ],
     });
 
-    const client = new OpenCodeAgentClient(createTestLogger(), undefined, undefined, { runtime });
+    const client = new OpenCodeAgentClient(createTestLogger(), undefined, { runtime });
     const modes = await client.listModes({ cwd: "/tmp/project", force: false });
 
     expect(modes.map((mode) => mode.id)).toEqual(["build", "plan", "full-access", "paseo-custom"]);
@@ -84,7 +83,7 @@ describe("OpenCode full-access mode", () => {
   test("reports full-access but sends prompts through OpenCode build agent", async () => {
     const { openCodeClient, runtime } = mockOpenCodeClient();
 
-    const client = new OpenCodeAgentClient(createTestLogger(), undefined, undefined, { runtime });
+    const client = new OpenCodeAgentClient(createTestLogger(), undefined, { runtime });
     const session = await client.createSession({
       provider: "opencode",
       cwd: "/tmp/project",
@@ -109,7 +108,7 @@ describe("OpenCode full-access mode", () => {
     });
     const receivedEvents: AgentStreamEvent[] = [];
 
-    const client = new OpenCodeAgentClient(createTestLogger(), undefined, undefined, { runtime });
+    const client = new OpenCodeAgentClient(createTestLogger(), undefined, { runtime });
     const session = await client.createSession({
       provider: "opencode",
       cwd: "/tmp/project",
@@ -137,7 +136,7 @@ describe("OpenCode full-access mode", () => {
     });
     const receivedEvents: AgentStreamEvent[] = [];
 
-    const client = new OpenCodeAgentClient(createTestLogger(), undefined, undefined, { runtime });
+    const client = new OpenCodeAgentClient(createTestLogger(), undefined, { runtime });
     const session = await client.createSession({
       provider: "opencode",
       cwd: "/tmp/project",

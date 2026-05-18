@@ -140,7 +140,7 @@ Single file, validated with `PersistedConfigSchema`.
     hostnames: true | string[],   // legacy alias `allowedHosts` is migrated on load
     mcp: { enabled: boolean, injectIntoAgents: boolean },
     cors: { allowedOrigins: string[] },
-    relay: { enabled: boolean, endpoint: string, publicEndpoint: string, useTls: boolean },
+    relay: { enabled: boolean, endpoint: string, publicEndpoint: string, useTls: boolean, publicUseTls: boolean },
     auth: { password: string }    // bcrypt hash, optional
   },
   app: {
@@ -157,8 +157,8 @@ Single file, validated with `PersistedConfigSchema`.
     providers: Record<providerId, ProviderOverride>
   },
   features: {
-    dictation: { enabled, stt: { provider, model, confidenceThreshold } },
-    voiceMode: { enabled, llm, stt, turnDetection, tts: { provider, model, voice, speakerId, speed } }
+    dictation: { enabled, stt: { provider, model, language, confidenceThreshold } },
+    voiceMode: { enabled, llm, stt: { provider, model, language }, turnDetection, tts: { provider, model, voice, speakerId, speed } }
   },
   log: {
     level, format,
@@ -361,6 +361,11 @@ Array of project records.
 | `createdAt`   | `string` (ISO 8601)         |                                          |
 | `updatedAt`   | `string` (ISO 8601)         |                                          |
 | `archivedAt`  | `string \| null` (ISO 8601) | Soft-delete timestamp; required nullable |
+
+Active git projects are unique by normalized `rootPath`. Startup reconciliation repairs older bad
+states by moving workspaces from duplicate path-keyed projects onto the canonical project,
+preferring remote-keyed project IDs such as `remote:github.com/owner/repo`, then archiving the
+emptied duplicate.
 
 ---
 

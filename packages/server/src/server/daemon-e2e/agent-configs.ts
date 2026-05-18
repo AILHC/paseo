@@ -44,13 +44,13 @@ export const agentConfigs = {
     provider: "copilot",
     model: "claude-haiku-4.5",
     modes: {
-      full: "https://agentclientprotocol.com/protocol/session-modes#autopilot",
+      full: "allow-all",
       ask: "https://agentclientprotocol.com/protocol/session-modes#agent",
     },
   },
   opencode: {
     provider: "opencode",
-    model: "opencode/glm-5-free",
+    model: "opencode/big-pickle",
     modes: {
       full: "default",
       ask: "default",

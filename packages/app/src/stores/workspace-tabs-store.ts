@@ -1,18 +1,30 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import type { AgentProvider } from "@server/server/agent/agent-sdk-types";
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 import {
   buildDeterministicWorkspaceTabId,
+  normalizeWorkspaceDraftTabSetup,
   normalizeWorkspaceTabTarget,
   workspaceTabTargetsEqual,
-} from "@/utils/workspace-tab-identity";
+} from "@/workspace-tabs/identity";
+import type { WorkspaceFileTabTarget } from "@/workspace/file-open";
+
+export interface WorkspaceDraftTabSetup {
+  provider: AgentProvider;
+  cwd: string;
+  modeId: string | null;
+  model: string | null;
+  thinkingOptionId: string | null;
+  featureValues: Record<string, unknown>;
+}
 
 export type WorkspaceTabTarget =
-  | { kind: "draft"; draftId: string }
+  | { kind: "draft"; draftId: string; setup?: WorkspaceDraftTabSetup }
   | { kind: "agent"; agentId: string }
   | { kind: "terminal"; terminalId: string }
   | { kind: "browser"; browserId: string }
-  | { kind: "file"; path: string }
+  | WorkspaceFileTabTarget
   | { kind: "setup"; workspaceId: string };
 
 export interface WorkspaceTab {
@@ -140,7 +152,12 @@ function extractMigrationRawSources(persistedState: unknown): MigrationRawSource
 function coerceWorkspaceTabTarget(raw: Record<string, unknown>): WorkspaceTabTarget | null {
   const kind = typeof raw.kind === "string" ? raw.kind : null;
   if (kind === "draft" && typeof raw.draftId === "string") {
-    return normalizeWorkspaceTabTarget({ kind: "draft", draftId: raw.draftId });
+    const setup = normalizeWorkspaceDraftTabSetup(raw.setup);
+    return normalizeWorkspaceTabTarget({
+      kind: "draft",
+      draftId: raw.draftId,
+      ...(setup ? { setup } : {}),
+    });
   }
   if (kind === "agent" && typeof raw.agentId === "string") {
     return normalizeWorkspaceTabTarget({ kind: "agent", agentId: raw.agentId });
@@ -152,7 +169,12 @@ function coerceWorkspaceTabTarget(raw: Record<string, unknown>): WorkspaceTabTar
     return normalizeWorkspaceTabTarget({ kind: "browser", browserId: raw.browserId });
   }
   if (kind === "file" && typeof raw.path === "string") {
-    return normalizeWorkspaceTabTarget({ kind: "file", path: raw.path });
+    return normalizeWorkspaceTabTarget({
+      kind: "file",
+      path: raw.path,
+      lineStart: typeof raw.lineStart === "number" ? raw.lineStart : undefined,
+      lineEnd: typeof raw.lineEnd === "number" ? raw.lineEnd : undefined,
+    });
   }
   if (kind === "setup" && typeof raw.workspaceId === "string") {
     return normalizeWorkspaceTabTarget({ kind: "setup", workspaceId: raw.workspaceId });

@@ -10,6 +10,7 @@ import {
 import Animated, { runOnJS, useAnimatedReaction } from "react-native-reanimated";
 import { StyleSheet, useUnistyles } from "react-native-unistyles";
 import { encodeTerminalKeyInput } from "@server/shared/terminal-key-input";
+import type { TerminalInputModeState } from "@server/shared/terminal-input-mode";
 import { useHostRuntimeClient, useHostRuntimeIsConnected } from "@/runtime/host-runtime";
 import { useKeyboardShiftStyle } from "@/hooks/use-keyboard-shift-style";
 import { useAppVisible } from "@/hooks/use-app-visible";
@@ -34,6 +35,7 @@ import {
   shouldShowTerminalLoadingOverlay,
   type TerminalRendererReadyChange,
 } from "@/utils/terminal-renderer-readiness";
+import { useAppSettings } from "@/hooks/use-settings";
 
 interface TerminalPaneProps {
   serverId: string;
@@ -156,6 +158,7 @@ export function TerminalPane({
 }: TerminalPaneProps) {
   const isAppVisible = useAppVisible();
   const { theme } = useUnistyles();
+  const { settings } = useAppSettings();
   const xtermTheme = useMemo(() => toXtermTheme(theme.colors.terminal), [theme]);
   const isMobile = useIsCompactFormFactor();
   const mobileView = usePanelStore((state) => state.mobileView);
@@ -188,6 +191,10 @@ export function TerminalPane({
   const [resizeRequestToken, setResizeRequestToken] = useState(0);
   const emulatorRef = useRef<TerminalEmulatorHandle>(null);
   const terminalIdRef = useRef<string>(terminalId);
+  const inputModeRef = useRef<TerminalInputModeState>({
+    kittyKeyboardFlags: 0,
+    win32InputMode: false,
+  });
   const pendingTerminalInputRef = useRef<PendingTerminalInput[]>([]);
   const keyboardRefitTimeoutsRef = useRef<Array<ReturnType<typeof setTimeout>>>([]);
   const lastAutoFocusKeyRef = useRef<string | null>(null);
@@ -195,6 +202,10 @@ export function TerminalPane({
 
   useEffect(() => {
     terminalIdRef.current = terminalId;
+    inputModeRef.current = {
+      kittyKeyboardFlags: 0,
+      win32InputMode: false,
+    };
   }, [terminalId]);
 
   const requestTerminalFocus = useCallback(() => {
@@ -413,7 +424,9 @@ export function TerminalPane({
         return true;
       }
 
-      const encoded = encodeTerminalKeyInput(entry.input);
+      const encoded = encodeTerminalKeyInput(entry.input, {
+        inputMode: inputModeRef.current,
+      });
       if (encoded.length === 0) {
         return true;
       }
@@ -595,6 +608,10 @@ export function TerminalPane({
     clearPendingModifiers();
   }, [clearPendingModifiers]);
 
+  const handleInputModeChange = useCallback((state: TerminalInputModeState) => {
+    inputModeRef.current = state;
+  }, []);
+
   const toggleModifier = useCallback(
     (modifier: keyof ModifierState) => {
       setModifiers((current) => ({ ...current, [modifier]: !current[modifier] }));
@@ -666,6 +683,7 @@ export function TerminalPane({
               streamKey={terminalStreamKey}
               testId="terminal-surface"
               xtermTheme={xtermTheme}
+              scrollbackLines={settings.terminalScrollbackLines}
               swipeGesturesEnabled={swipeGesturesEnabled}
               initialSnapshot={initialSnapshot}
               onRendererReadyChange={handleRendererReadyChange}
@@ -674,6 +692,7 @@ export function TerminalPane({
               onInput={handleTerminalData}
               onResize={handleTerminalResize}
               onTerminalKey={handleTerminalKey}
+              onInputModeChange={handleInputModeChange}
               onPendingModifiersConsumed={handlePendingModifiersConsumed}
               pendingModifiers={modifiers}
               focusRequestToken={focusRequestToken}

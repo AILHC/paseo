@@ -2,6 +2,7 @@ import { resolve, dirname, basename } from "path";
 import { existsSync, realpathSync } from "fs";
 import { open as openFile, readFile, stat as statFile } from "fs/promises";
 import { TTLCache } from "@isaacs/ttlcache";
+import type { Logger } from "pino";
 import type { ParsedDiffFile } from "../server/utils/diff-highlighter.js";
 import { parseAndHighlightDiff } from "../server/utils/diff-highlighter.js";
 import { parseGitHubRepoFromRemote } from "../server/workspace-git-metadata.js";
@@ -11,6 +12,8 @@ import {
   GitHubCommandError,
   createGitHubService,
   resolveGitHubRepo,
+  type GitHubCurrentPullRequestStatus,
+  type GitHubPullRequestStatusFacts,
   type GitHubService,
   type PullRequestMergeable,
 } from "../services/github-service.js";
@@ -536,6 +539,15 @@ function buildGitDiffArgs(args: { ignoreWhitespace?: boolean; extra: string[] })
 
 const TRACKED_DIFF_NUMSTAT_MAX_BYTES = 2 * 1024 * 1024; // 2MB
 const TRACKED_MAX_CHANGED_LINES = 40_000;
+const EMPTY_TREE_OBJECT_ID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+function isUnbornHeadDiffError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    error.message.includes("--name-status HEAD") &&
+    error.message.includes("ambiguous argument 'HEAD'")
+  );
+}
 
 async function getTrackedNumstatByPath(
   cwd: string,
@@ -710,6 +722,7 @@ export interface MergeFromBaseOptions {
 
 export interface CheckoutContext {
   paseoHome?: string;
+  logger?: Pick<Logger, "trace">;
 }
 
 function isGitError(error: unknown): boolean {
@@ -765,11 +778,12 @@ async function getRebaseHeadBranch(cwd: string): Promise<string | null> {
   return results.find((result): result is string => result !== null) ?? null;
 }
 
-async function getWorktreeRoot(cwd: string): Promise<string | null> {
+async function getWorktreeRoot(cwd: string, context?: CheckoutContext): Promise<string | null> {
   try {
     const { stdout } = await runGitCommand(["rev-parse", "--show-toplevel"], {
       cwd,
       envOverlay: READ_ONLY_GIT_ENV,
+      logger: context?.logger,
     });
     return parseGitRevParsePath(stdout);
   } catch {
@@ -958,10 +972,11 @@ async function resolveBaseRefForCwd(
   };
 }
 
-async function isWorkingTreeDirty(cwd: string): Promise<boolean> {
+async function isWorkingTreeDirty(cwd: string, context?: CheckoutContext): Promise<boolean> {
   const { stdout } = await runGitCommand(["status", "--porcelain"], {
     cwd,
     envOverlay: READ_ONLY_GIT_ENV,
+    logger: context?.logger,
   });
   return stdout.trim().length > 0;
 }
@@ -984,11 +999,16 @@ export async function hasOriginRemote(cwd: string): Promise<boolean> {
   return url !== null;
 }
 
-async function getGitConfigValue(cwd: string, key: string): Promise<string | null> {
+async function getGitConfigValue(
+  cwd: string,
+  key: string,
+  context?: CheckoutContext,
+): Promise<string | null> {
   try {
     const { stdout } = await runGitCommand(["config", "--get", key], {
       cwd,
       envOverlay: READ_ONLY_GIT_ENV,
+      logger: context?.logger,
     });
     const value = stdout.trim();
     return value.length > 0 ? value : null;
@@ -1149,20 +1169,29 @@ function normalizeComparisonBaseRefName(input: string): ComparisonBaseRefName {
   return { localName, originRef: `origin/${localName}` };
 }
 
-async function doesGitRefExist(cwd: string, fullRef: string): Promise<boolean> {
+async function doesGitRefExist(
+  cwd: string,
+  fullRef: string,
+  context?: CheckoutContext,
+): Promise<boolean> {
   const result = await runGitCommand(["show-ref", "--verify", "--quiet", fullRef], {
     cwd,
     envOverlay: READ_ONLY_GIT_ENV,
     acceptExitCodes: [0, 1],
+    logger: context?.logger,
   });
   return result.exitCode === 0;
 }
 
-async function resolveBestComparisonBaseRef(cwd: string, baseRef: string): Promise<string> {
+async function resolveBestComparisonBaseRef(
+  cwd: string,
+  baseRef: string,
+  context?: CheckoutContext,
+): Promise<string> {
   const normalized = normalizeComparisonBaseRefName(baseRef);
   const [hasLocal, hasOrigin] = await Promise.all([
-    doesGitRefExist(cwd, `refs/heads/${normalized.localName}`),
-    doesGitRefExist(cwd, `refs/remotes/origin/${normalized.localName}`),
+    doesGitRefExist(cwd, `refs/heads/${normalized.localName}`, context),
+    doesGitRefExist(cwd, `refs/remotes/origin/${normalized.localName}`, context),
   ]);
 
   if (hasOrigin) {
@@ -1216,15 +1245,16 @@ async function getAheadBehind(
   cwd: string,
   baseRef: string,
   currentBranch: string,
+  context?: CheckoutContext,
 ): Promise<AheadBehind | null> {
   const normalizedBaseRef = normalizeLocalBranchRefName(baseRef);
   if (!normalizedBaseRef || !currentBranch || normalizedBaseRef === currentBranch) {
     return null;
   }
-  const comparisonBaseRef = await resolveBestComparisonBaseRef(cwd, baseRef);
+  const comparisonBaseRef = await resolveBestComparisonBaseRef(cwd, baseRef, context);
   const { stdout } = await runGitCommand(
     ["rev-list", "--left-right", "--count", `${comparisonBaseRef}...${currentBranch}`],
-    { cwd, envOverlay: READ_ONLY_GIT_ENV },
+    { cwd, envOverlay: READ_ONLY_GIT_ENV, logger: context?.logger },
   );
   const [behindRaw, aheadRaw] = stdout.trim().split(/\s+/);
   const behind = Number.parseInt(behindRaw ?? "0", 10);
@@ -1235,22 +1265,32 @@ async function getAheadBehind(
   return { ahead, behind };
 }
 
-async function getAheadOfOrigin(cwd: string, currentBranch: string): Promise<number | null> {
+async function getAheadOfOrigin(
+  cwd: string,
+  currentBranch: string,
+  context?: CheckoutContext,
+): Promise<number | null> {
   if (!currentBranch) {
     return null;
   }
+  const trackedOriginBranch = await getTrackedOriginBranch(cwd, currentBranch, context);
+  const originBranch = trackedOriginBranch ?? currentBranch;
   try {
     const { stdout } = await runGitCommand(
-      ["rev-list", "--count", `origin/${currentBranch}..${currentBranch}`],
-      { cwd, envOverlay: READ_ONLY_GIT_ENV },
+      ["rev-list", "--count", `origin/${originBranch}..${currentBranch}`],
+      { cwd, envOverlay: READ_ONLY_GIT_ENV, logger: context?.logger },
     );
     const count = Number.parseInt(stdout.trim(), 10);
     return Number.isNaN(count) ? null : count;
   } catch {
+    if (trackedOriginBranch) {
+      return null;
+    }
     try {
       const { stdout } = await runGitCommand(["rev-list", "--count", currentBranch], {
         cwd,
         envOverlay: READ_ONLY_GIT_ENV,
+        logger: context?.logger,
       });
       const count = Number.parseInt(stdout.trim(), 10);
       return Number.isNaN(count) ? null : count;
@@ -1260,14 +1300,32 @@ async function getAheadOfOrigin(cwd: string, currentBranch: string): Promise<num
   }
 }
 
-async function getBehindOfOrigin(cwd: string, currentBranch: string): Promise<number | null> {
+async function getTrackedOriginBranch(
+  cwd: string,
+  currentBranch: string,
+  context?: CheckoutContext,
+): Promise<string | null> {
+  const remoteName = await getGitConfigValue(cwd, `branch.${currentBranch}.remote`, context);
+  if (remoteName !== "origin") {
+    return null;
+  }
+
+  const mergeRef = await getGitConfigValue(cwd, `branch.${currentBranch}.merge`, context);
+  return parseBranchMergeHeadRef(mergeRef);
+}
+
+async function getBehindOfOrigin(
+  cwd: string,
+  currentBranch: string,
+  context?: CheckoutContext,
+): Promise<number | null> {
   if (!currentBranch) {
     return null;
   }
   try {
     const { stdout } = await runGitCommand(
       ["rev-list", "--count", `${currentBranch}..origin/${currentBranch}`],
-      { cwd, envOverlay: READ_ONLY_GIT_ENV },
+      { cwd, envOverlay: READ_ONLY_GIT_ENV, logger: context?.logger },
     );
     const count = Number.parseInt(stdout.trim(), 10);
     return Number.isNaN(count) ? null : count;
@@ -1288,7 +1346,7 @@ async function inspectCheckoutContext(
   context?: CheckoutContext,
 ): Promise<CheckoutInspectionContext | null> {
   try {
-    const root = await getWorktreeRoot(cwd);
+    const root = await getWorktreeRoot(cwd, context);
     if (!root) {
       return null;
     }
@@ -1436,14 +1494,20 @@ export async function getCheckoutStatus(
   const currentBranch = inspected.currentBranch;
   const remoteUrl = inspected.remoteUrl;
   const paseoWorktree = inspected.paseoWorktree;
-  const isDirty = await isWorkingTreeDirty(cwd);
+  const isDirty = await isWorkingTreeDirty(cwd, context);
   const hasRemote = remoteUrl !== null;
   const { resolvedBaseRef: baseRef } = await resolveBaseRefForCwd(cwd, context);
   const mainRepoRoot = await getMainRepoRoot(cwd).catch(() => null);
   const [aheadBehind, aheadOfOrigin, behindOfOrigin] = await Promise.all([
-    baseRef && currentBranch ? getAheadBehind(cwd, baseRef, currentBranch) : Promise.resolve(null),
-    hasRemote && currentBranch ? getAheadOfOrigin(cwd, currentBranch) : Promise.resolve(null),
-    hasRemote && currentBranch ? getBehindOfOrigin(cwd, currentBranch) : Promise.resolve(null),
+    baseRef && currentBranch
+      ? getAheadBehind(cwd, baseRef, currentBranch, context)
+      : Promise.resolve(null),
+    hasRemote && currentBranch
+      ? getAheadOfOrigin(cwd, currentBranch, context)
+      : Promise.resolve(null),
+    hasRemote && currentBranch
+      ? getBehindOfOrigin(cwd, currentBranch, context)
+      : Promise.resolve(null),
   ]);
 
   if (paseoWorktree.isPaseoOwnedWorktree && baseRef) {
@@ -1871,7 +1935,17 @@ export async function getCheckoutDiff(
   }
 
   const ignoreWhitespace = compare.ignoreWhitespace === true;
-  const changes = await listCheckoutFileChanges(cwd, refsForDiff, ignoreWhitespace);
+  let effectiveRefsForDiff = refsForDiff;
+  let changes: CheckoutFileChange[];
+  try {
+    changes = await listCheckoutFileChanges(cwd, effectiveRefsForDiff, ignoreWhitespace);
+  } catch (error) {
+    if (!isUnbornHeadDiffError(error)) {
+      throw error;
+    }
+    effectiveRefsForDiff = { ...refsForDiff, baseRef: EMPTY_TREE_OBJECT_ID };
+    changes = await listCheckoutFileChanges(cwd, effectiveRefsForDiff, ignoreWhitespace);
+  }
   changes.sort((a, b) => {
     if (a.path === b.path) return 0;
     return a.path < b.path ? -1 : 1;
@@ -1902,7 +1976,7 @@ export async function getCheckoutDiff(
 
   const trackedNumstatByPath =
     trackedChanges.length > 0
-      ? await getTrackedNumstatByPath(cwd, refsForDiff, ignoreWhitespace)
+      ? await getTrackedNumstatByPath(cwd, effectiveRefsForDiff, ignoreWhitespace)
       : new Map<string, FileStat>();
   const trackedDiffPaths: string[] = [];
   const trackedPlaceholderByPath = new Map<
@@ -1929,7 +2003,7 @@ export async function getCheckoutDiff(
     const trackedDiffResult = await runGitCommand(
       buildGitDiffArgs({
         ignoreWhitespace,
-        extra: [...getCheckoutDiffRefArgs(refsForDiff), "--", ...trackedDiffPaths],
+        extra: [...getCheckoutDiffRefArgs(effectiveRefsForDiff), "--", ...trackedDiffPaths],
       }),
       {
         cwd,
@@ -1965,7 +2039,7 @@ export async function getCheckoutDiff(
       trackedPlaceholderByPath,
       trackedDiffText,
       trackedDiffTruncated,
-      refsForDiff,
+      refsForDiff: effectiveRefsForDiff,
       ignoreWhitespace,
       structured,
       appendDiff,
@@ -2318,6 +2392,7 @@ export interface PullRequestStatus {
   checks?: PullRequestCheck[];
   checksStatus?: ChecksStatus;
   reviewDecision?: ReviewDecision;
+  github?: GitHubPullRequestStatusFacts;
 }
 
 export interface PullRequestStatusResult {
@@ -2402,7 +2477,7 @@ export async function getPullRequestStatus(
       return status;
     })
     .catch((error) => {
-      if (error instanceof GitHubCommandError) {
+      if (!options?.force && error instanceof GitHubCommandError) {
         const stale = lastSuccessfulPullRequestStatus.get(cacheKey);
         if (stale) {
           return stale;
@@ -2433,11 +2508,25 @@ async function getPullRequestStatusUncached(
   }
   try {
     const lookupTarget = await resolvePullRequestStatusLookupTarget(cwd, head);
-    const status = await github.getCurrentPullRequestStatus({
-      cwd,
-      ...lookupTarget,
-      reason: options?.reason,
-    });
+    let status: GitHubCurrentPullRequestStatus | null;
+    if (options?.force) {
+      const reason = options.reason;
+      if (!reason) {
+        throw new Error("Forced PR status read requires a reason");
+      }
+      status = await github.getCurrentPullRequestStatus({
+        cwd,
+        ...lookupTarget,
+        force: true,
+        reason,
+      });
+    } else {
+      status = await github.getCurrentPullRequestStatus({
+        cwd,
+        ...lookupTarget,
+        reason: options?.reason,
+      });
+    }
     return {
       status,
       githubFeaturesEnabled: true,

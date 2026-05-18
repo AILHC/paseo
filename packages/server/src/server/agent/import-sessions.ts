@@ -20,6 +20,7 @@ import type {
   RecentProviderSessionDescriptorPayload,
 } from "../../shared/messages.js";
 import type { WorkspaceGitService } from "../workspace-git-service.js";
+import { createPathEquivalenceMatcher } from "../../utils/path.js";
 
 type ImportAgentRequestMessage = z.infer<typeof ImportAgentRequestMessageSchema>;
 
@@ -111,8 +112,9 @@ export async function listImportableProviderSessions(
   });
   let filteredAlreadyImportedCount = 0;
   const candidates: PersistedAgentDescriptor[] = [];
+  const matchesRequestCwd = request.cwd ? createPathEquivalenceMatcher(request.cwd) : null;
   for (const descriptor of descriptors) {
-    if (request.cwd && descriptor.cwd !== request.cwd) {
+    if (matchesRequestCwd && !matchesRequestCwd(descriptor.cwd)) {
       continue;
     }
     if (sinceTimestamp !== null && descriptor.lastActivityAt.getTime() < sinceTimestamp) {
@@ -146,7 +148,9 @@ export async function importProviderSession(
   input: ImportProviderSessionInput,
 ): Promise<ImportProviderSessionResult> {
   const { provider, providerHandleId, cwd, labels } = input.request;
-  const descriptor = await input.agentManager.findPersistedAgent(provider, providerHandleId);
+  const descriptor = await input.agentManager.findPersistedAgent(provider, providerHandleId, {
+    cwd,
+  });
   if (!descriptor && provider === "opencode" && !cwd) {
     throw new Error(
       "OpenCode sessions require --cwd when the session cannot be found in persisted agents",

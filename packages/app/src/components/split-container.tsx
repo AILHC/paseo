@@ -67,7 +67,7 @@ import {
   type WorkspaceLayout,
 } from "@/stores/workspace-layout-store";
 import type { WorkspaceTab } from "@/stores/workspace-tabs-store";
-import { workspaceTabTargetsEqual } from "@/utils/workspace-tab-identity";
+import { workspaceTabTargetsEqual } from "@/workspace-tabs/identity";
 import { isNative } from "@/constants/platform";
 
 interface SplitContainerProps {
@@ -406,6 +406,7 @@ export function SplitContainer({
     }
     return { kind: "pane" as const, pane: focusedPane };
   }, [focusModeEnabled, layout.root, layout.focusedPaneId, panesById]);
+  const renderRoot = useMemo(() => wrapRootPaneForStableMount(effectiveRoot), [effectiveRoot]);
 
   const handleDragStart = useCallback((event: DragStartEvent) => {
     const data = asWorkspaceTabDragData(event.active.data.current);
@@ -560,7 +561,7 @@ export function SplitContainer({
       onDragEnd={handleDragEnd}
     >
       <SplitNodeView
-        node={effectiveRoot}
+        node={renderRoot}
         workspaceKey={workspaceKey}
         uiTabs={uiTabs}
         focusedPaneId={layout.focusedPaneId}
@@ -1069,6 +1070,22 @@ function getNodeKey(node: SplitNode): string {
     return node.pane.id;
   }
   return node.group.id;
+}
+
+function wrapRootPaneForStableMount(node: SplitNode): SplitNode {
+  if (node.kind === "group") {
+    return node;
+  }
+
+  return {
+    kind: "group",
+    group: {
+      id: `root:${node.pane.id}`,
+      direction: "horizontal",
+      children: [node],
+      sizes: [1],
+    },
+  };
 }
 
 const styles = StyleSheet.create((theme) => ({

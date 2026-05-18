@@ -21,7 +21,6 @@ import {
   Paperclip,
 } from "lucide-react-native";
 import Animated from "react-native-reanimated";
-import { useQuery } from "@tanstack/react-query";
 import { FOOTER_HEIGHT, MAX_CONTENT_WIDTH } from "@/constants/layout";
 import {
   AgentStatusBar,
@@ -53,7 +52,7 @@ import {
   queueComposerMessage,
   removeComposerAttachmentAtIndex,
   sendQueuedComposerMessageNow,
-  toggleGithubAttachment,
+  toggleGithubAttachmentFromPicker,
   type AgentStreamWriter,
   type QueueWriter,
   type QueuedComposerMessage,
@@ -97,6 +96,10 @@ import { AttachmentPill } from "@/components/attachment-pill";
 import { AttachmentLightbox } from "@/components/attachment-lightbox";
 import { openExternalUrl } from "@/utils/open-external-url";
 import { useIsDictationReady } from "@/hooks/use-is-dictation-ready";
+import { useGithubSearchQuery } from "@/git/use-github-search-query";
+import { useCheckoutStatusQuery } from "@/git/use-status-query";
+import { useComposerGithubAutoAttach } from "./use-composer-github-auto-attach";
+import { resolveClientSlashCommand, type ClientSlashCommand } from "@/client-slash-commands";
 
 type QueuedMessage = QueuedComposerMessage;
 
@@ -137,6 +140,20 @@ function resolveMessagePlaceholder(isDesktopWebBreakpoint: boolean): string {
   return isDesktopWebBreakpoint ? DESKTOP_MESSAGE_PLACEHOLDER : MOBILE_MESSAGE_PLACEHOLDER;
 }
 
+function resolveGithubSearchEnabled(
+  isGithubPickerOpen: boolean,
+  isConnected: boolean,
+  cwd: string,
+): boolean {
+  return isGithubPickerOpen && isConnected && cwd.trim().length > 0;
+}
+
+function resolveCheckoutRemoteUrl(
+  checkoutStatus: ReturnType<typeof useCheckoutStatusQuery>["status"],
+): string | null {
+  return checkoutStatus?.remoteUrl ?? null;
+}
+
 function buildCancelButtonStyle(isConnected: boolean, isCancellingAgent: boolean): object[] {
   const disabled = !isConnected || isCancellingAgent ? styles.buttonDisabled : undefined;
   return [styles.cancelButton, disabled].filter((value): value is object => Boolean(value));
@@ -161,31 +178,6 @@ function buildAgentStateSelector(serverId: string, agentId: string) {
       contextWindowMaxTokens: agent?.lastUsage?.contextWindowMaxTokens ?? null,
       contextWindowUsedTokens: agent?.lastUsage?.contextWindowUsedTokens ?? null,
     };
-  };
-}
-
-interface BuildGithubSearchQueryOptionsArgs {
-  serverId: string;
-  cwd: string;
-  githubSearchQueryTrimmed: string;
-  isGithubPickerOpen: boolean;
-  isConnected: boolean;
-  client: ReturnType<typeof useHostRuntimeClient>;
-}
-
-function buildGithubSearchQueryOptions(args: BuildGithubSearchQueryOptionsArgs) {
-  const { serverId, cwd, githubSearchQueryTrimmed, isGithubPickerOpen, isConnected, client } = args;
-  const hasClient = Boolean(client);
-  const cwdIsSet = cwd.trim().length > 0;
-  const enabled = isGithubPickerOpen && isConnected && hasClient && cwdIsSet;
-  return {
-    queryKey: ["composer-github-search", serverId, cwd, githubSearchQueryTrimmed],
-    queryFn: async () => {
-      if (!client) throw new Error("Host is not connected");
-      return client.searchGitHub({ cwd, query: githubSearchQueryTrimmed, limit: 20 });
-    },
-    enabled,
-    staleTime: 30_000,
   };
 }
 
@@ -616,6 +608,7 @@ interface ComposerProps {
   serverId: string;
   isPaneFocused: boolean;
   onSubmitMessage?: (payload: MessagePayload) => Promise<void>;
+  onClientSlashCommand?: (command: ClientSlashCommand) => Promise<void>;
   /** When true, the submit button is enabled even without text or images (e.g. external attachment selected). */
   hasExternalContent?: boolean;
   /** When true, the composer can submit even with no text or attachments. */
@@ -748,6 +741,7 @@ interface ComposerRightControlsSlotProps extends ComposerVoiceModeButtonProps {
   isAgentRunning: boolean;
   hasSendableContent: boolean;
   isProcessing: boolean;
+  isCompact: boolean;
   cancelButton: ReactElement;
 }
 
@@ -757,10 +751,12 @@ function ComposerRightControlsSlot({
   isAgentRunning,
   hasSendableContent,
   isProcessing,
+  isCompact,
   cancelButton,
   ...voiceProps
 }: ComposerRightControlsSlotProps) {
-  const showVoiceModeButton = !isVoiceModeForAgent && hasAgent;
+  const hideVoiceForCompactInput = isCompact && hasSendableContent;
+  const showVoiceModeButton = !isVoiceModeForAgent && hasAgent && !hideVoiceForCompactInput;
   const shouldShowCancelButton = isAgentRunning && !hasSendableContent && !isProcessing;
   if (!showVoiceModeButton && !shouldShowCancelButton) return null;
   return (
@@ -816,6 +812,7 @@ export function Composer({
   serverId,
   isPaneFocused,
   onSubmitMessage,
+  onClientSlashCommand,
   hasExternalContent = false,
   allowEmptySubmit = false,
   submitButtonAccessibilityLabel,
@@ -890,6 +887,17 @@ export function Composer({
     onOpenWorkspaceAttachment,
   });
   const setSelectedAttachments = onChangeAttachments;
+  const checkoutStatusQuery = useCheckoutStatusQuery({ serverId, cwd });
+  const githubAutoAttach = useComposerGithubAutoAttach({
+    text: userInput,
+    remoteUrl: resolveCheckoutRemoteUrl(checkoutStatusQuery.status),
+    attachments,
+    client,
+    isConnected,
+    serverId,
+    cwd,
+    setAttachments: setSelectedAttachments,
+  });
   const [cursorIndex, setCursorIndex] = useState(0);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isCancellingAgent, setIsCancellingAgent] = useState(false);
@@ -905,6 +913,41 @@ export function Composer({
     `message-input:${serverId}:${agentId}:${Math.random().toString(36).slice(2)}`,
   );
 
+  const runClientSlashCommand = useCallback(
+    (command: ClientSlashCommand): boolean => {
+      if (command.execution !== "immediate" || !onClientSlashCommand) {
+        return false;
+      }
+
+      if (blurOnSubmit) {
+        messageInputRef.current?.blur();
+      }
+      clearDraft("sent");
+      setUserInput("");
+      setSelectedAttachments([]);
+      resetSuppression();
+      setSendError(null);
+      setIsProcessing(true);
+      void onClientSlashCommand(command)
+        .catch((error) => {
+          console.error("[Composer] Failed to run client slash command:", error);
+          setSendError(error instanceof Error ? error.message : String(error));
+        })
+        .finally(() => {
+          setIsProcessing(false);
+        });
+      return true;
+    },
+    [
+      blurOnSubmit,
+      clearDraft,
+      onClientSlashCommand,
+      resetSuppression,
+      setSelectedAttachments,
+      setUserInput,
+    ],
+  );
+
   const autocomplete = useAgentAutocomplete({
     userInput,
     cursorIndex,
@@ -912,6 +955,8 @@ export function Composer({
     serverId,
     agentId,
     draftConfig: commandDraftConfig,
+    canExecuteClientSlashCommand: buildOutgoingAttachments(attachments).length === 0,
+    onClientSlashCommand: runClientSlashCommand,
     onAutocompleteApplied: () => {
       messageInputRef.current?.focus();
     },
@@ -1107,16 +1152,27 @@ export function Composer({
 
   const handleSubmit = useCallback(
     (payload: MessagePayload) => {
+      const outgoingAttachments = buildOutgoingAttachments(attachments);
+      const clientSlashCommand = resolveClientSlashCommand({
+        text: payload.text,
+        hasAttachments: outgoingAttachments.length > 0,
+      });
+      if (clientSlashCommand && runClientSlashCommand(clientSlashCommand)) {
+        return;
+      }
+
       if (blurOnSubmit) {
         messageInputRef.current?.blur();
       }
-      void sendMessageWithContent(
-        payload.text,
-        buildOutgoingAttachments(attachments),
-        payload.forceSend,
-      );
+      void sendMessageWithContent(payload.text, outgoingAttachments, payload.forceSend);
     },
-    [attachments, blurOnSubmit, buildOutgoingAttachments, sendMessageWithContent],
+    [
+      attachments,
+      blurOnSubmit,
+      buildOutgoingAttachments,
+      runClientSlashCommand,
+      sendMessageWithContent,
+    ],
   );
 
   const handlePickImage = useCallback(async () => {
@@ -1135,6 +1191,7 @@ export function Composer({
 
   const handleRemoveAttachment = useCallback(
     (index: number) => {
+      githubAutoAttach.markGithubAttachmentRemoved(selectedAttachments[index]);
       const didRemoveWorkspaceAttachment = removeAttachment({
         selectedAttachments,
         index,
@@ -1146,7 +1203,7 @@ export function Composer({
         removeComposerAttachmentAtIndex({ attachments: prev, index, deleteAttachments }),
       );
     },
-    [removeAttachment, selectedAttachments, setSelectedAttachments],
+    [githubAutoAttach, removeAttachment, selectedAttachments, setSelectedAttachments],
   );
 
   const handleOpenAttachment = useCallback(
@@ -1277,18 +1334,25 @@ export function Composer({
 
   const handleQueue = useCallback(
     (payload: MessagePayload) => {
-      queueMessage(payload.text, buildOutgoingAttachments(attachments));
+      const outgoingAttachments = buildOutgoingAttachments(attachments);
+      const clientSlashCommand = resolveClientSlashCommand({
+        text: payload.text,
+        hasAttachments: outgoingAttachments.length > 0,
+      });
+      if (clientSlashCommand && runClientSlashCommand(clientSlashCommand)) {
+        return;
+      }
+      queueMessage(payload.text, outgoingAttachments);
     },
-    [attachments, buildOutgoingAttachments, queueMessage],
+    [attachments, buildOutgoingAttachments, queueMessage, runClientSlashCommand],
   );
 
   const hasSendableContent = userInput.trim().length > 0 || selectedAttachments.length > 0;
 
   // Handle keyboard navigation for command autocomplete.
   const handleCommandKeyPress = useCallback(
-    (event: { key: string; preventDefault: () => void }) => {
-      return autocompleteOnKeyPressRef.current(event);
-    },
+    (event: { key: string; preventDefault: () => void }) =>
+      autocompleteOnKeyPressRef.current(event),
     [],
   );
 
@@ -1340,6 +1404,7 @@ export function Composer({
         isAgentRunning={isAgentRunning}
         hasSendableContent={hasSendableContent}
         isProcessing={isProcessing}
+        isCompact={isMobile}
         buttonIconSize={buttonIconSize}
         handleToggleRealtimeVoice={handleToggleRealtimeVoice}
         isConnected={isConnected}
@@ -1357,6 +1422,7 @@ export function Composer({
       hasSendableContent,
       isAgentRunning,
       isConnected,
+      isMobile,
       isProcessing,
       isVoiceModeForAgent,
       isVoiceSwitching,
@@ -1376,16 +1442,13 @@ export function Composer({
   );
 
   const githubSearchQueryTrimmed = githubSearchQuery.trim();
-  const githubSearchResultsQuery = useQuery(
-    buildGithubSearchQueryOptions({
-      serverId,
-      cwd,
-      githubSearchQueryTrimmed,
-      isGithubPickerOpen,
-      isConnected,
-      client,
-    }),
-  );
+  const githubSearchResultsQuery = useGithubSearchQuery({
+    client,
+    serverId,
+    cwd,
+    query: githubSearchQueryTrimmed,
+    enabled: resolveGithubSearchEnabled(isGithubPickerOpen, isConnected, cwd),
+  });
 
   const githubSearchItemsRaw = githubSearchResultsQuery.data?.items;
   const githubSearchItems = useMemo(() => githubSearchItemsRaw ?? [], [githubSearchItemsRaw]);
@@ -1423,11 +1486,22 @@ export function Composer({
 
   const handleToggleGithubItem = useCallback(
     (item: GitHubSearchItem) => {
-      setSelectedAttachments((current) => toggleGithubAttachment(current, item));
+      const nextAttachments = toggleGithubAttachmentFromPicker({
+        current: attachments,
+        item,
+        markGithubAttachmentRemoved: githubAutoAttach.markGithubAttachmentRemoved,
+      });
+      setSelectedAttachments(nextAttachments);
       setIsGithubPickerOpen(false);
       setGithubSearchQuery("");
     },
-    [setSelectedAttachments, setGithubSearchQuery, setIsGithubPickerOpen],
+    [
+      attachments,
+      githubAutoAttach,
+      setSelectedAttachments,
+      setGithubSearchQuery,
+      setIsGithubPickerOpen,
+    ],
   );
 
   const leftContent = useMemo(

@@ -106,6 +106,7 @@ import {
   requireWorkspaceExecutionDirectory,
   resolveWorkspaceExecutionDirectory,
 } from "@/utils/workspace-execution";
+import { confirmRiskyWorktreeArchive } from "@/git/worktree-archive-warning";
 import {
   archiveWorkspaceOptimistically,
   archiveWorkspacesOptimistically,
@@ -593,7 +594,7 @@ function ProjectKebabMenu({
       <DropdownMenuTrigger
         hitSlop={8}
         style={projectKebabStyle}
-        accessibilityRole="button"
+        accessibilityRole={platformIsWeb ? undefined : "button"}
         accessibilityLabel="Project actions"
         testID={`sidebar-project-kebab-${projectKey}`}
       >
@@ -724,7 +725,7 @@ function WorkspaceKebabMenu({
       <DropdownMenuTrigger
         hitSlop={8}
         style={workspaceKebabStyle}
-        accessibilityRole="button"
+        accessibilityRole={platformIsWeb ? undefined : "button"}
         accessibilityLabel="Workspace actions"
         testID={`sidebar-workspace-kebab-${workspaceKey}`}
       >
@@ -894,7 +895,7 @@ function NewWorktreeButton({
             style={pressableStyle}
             onPress={handlePress}
             disabled={loading}
-            accessibilityRole="button"
+            accessibilityRole={platformIsWeb ? undefined : "button"}
             accessibilityLabel={`Create a new workspace for ${displayName}`}
             testID={testID}
           >
@@ -1172,10 +1173,13 @@ function ProjectHeaderRow({
       return;
     }
     router.navigate(
-      buildHostNewWorkspaceRoute(serverId, project.iconWorkingDir, { displayName }) as Href,
+      buildHostNewWorkspaceRoute(serverId, project.iconWorkingDir, {
+        displayName,
+        projectId: project.projectKey,
+      }) as Href,
     );
     onWorkspacePress?.();
-  }, [displayName, onWorkspacePress, project.iconWorkingDir, serverId]);
+  }, [displayName, onWorkspacePress, project.iconWorkingDir, project.projectKey, serverId]);
   const _mergeWorkspaces = useSessionStore((state) => state.mergeWorkspaces);
   const _toast = useToast();
 
@@ -1183,6 +1187,12 @@ function ProjectHeaderRow({
     drag,
     menuController,
   });
+  const {
+    role: _dragRole,
+    tabIndex: _dragTabIndex,
+    "aria-roledescription": _dragRoleDescription,
+    ...dragAttributes
+  } = dragHandleProps?.attributes ?? {};
 
   const handlePress = useCallback(() => {
     if (interaction.didLongPressRef.current) {
@@ -1246,7 +1256,7 @@ function ProjectHeaderRow({
   if (menuController) {
     return (
       <View
-        {...dragHandleProps?.attributes}
+        {...dragAttributes}
         {...dragHandleProps?.listeners}
         ref={dragHandleProps?.setActivatorNodeRef as unknown as Ref<View>}
         onPointerEnter={handlePointerEnter}
@@ -1254,6 +1264,7 @@ function ProjectHeaderRow({
       >
         <ContextMenuTrigger
           enabledOnMobile={false}
+          accessibilityRole="button"
           style={projectRowStyle}
           onPressIn={interaction.handlePressIn}
           onTouchMove={interaction.handleTouchMove}
@@ -1269,13 +1280,14 @@ function ProjectHeaderRow({
 
   return (
     <View
-      {...dragHandleProps?.attributes}
+      {...dragAttributes}
       {...dragHandleProps?.listeners}
       ref={dragHandleProps?.setActivatorNodeRef as unknown as Ref<View>}
       onPointerEnter={handlePointerEnter}
       onPointerLeave={handlePointerLeave}
     >
       <Pressable
+        accessibilityRole="button"
         style={projectRowStyle}
         onPressIn={interaction.handlePressIn}
         onTouchMove={interaction.handleTouchMove}
@@ -1324,6 +1336,12 @@ function WorkspaceRowInner({
     drag,
     menuController,
   });
+  const {
+    role: _dragRole,
+    tabIndex: _dragTabIndex,
+    "aria-roledescription": _dragRoleDescription,
+    ...dragAttributes
+  } = dragHandleProps?.attributes ?? {};
 
   const handlePress = useCallback(() => {
     if (interaction.didLongPressRef.current) {
@@ -1365,7 +1383,7 @@ function WorkspaceRowInner({
   return (
     <WorkspaceHoverCard workspace={workspace} prHint={prHint} isDragging={isDragging}>
       <View
-        {...dragHandleProps?.attributes}
+        {...dragAttributes}
         {...dragHandleProps?.listeners}
         ref={dragHandleProps?.setActivatorNodeRef as unknown as Ref<View>}
         style={styles.workspaceRowContainer}
@@ -1474,91 +1492,92 @@ function WorkspaceRowWithMenu({
     });
   }, [activeWorkspaceSelection, workspace.serverId, workspace.workspaceId]);
 
-  const handleArchiveWorktree = useCallback(() => {
+  const archiveWorktreeAfterConfirmation = useCallback(async () => {
     if (isArchiving) {
       return;
     }
 
-    void (async () => {
-      const confirmed = await confirmDialog({
-        title: "Archive worktree?",
-        message: `Archive "${workspace.name}"?\n\nThe worktree will be removed from disk, terminals will be stopped, and agents inside will be archived.\n\nYour branch is still accessible if you committed.`,
-        confirmLabel: "Archive",
-        cancelLabel: "Cancel",
-        destructive: true,
+    const confirmed = await confirmRiskyWorktreeArchive({
+      worktreeName: workspace.name,
+      isDirty: workspace.archiveHasUncommittedChanges,
+      aheadOfOrigin: workspace.archiveUnpushedCommitCount,
+      diffStat: workspace.diffStat,
+    });
+
+    if (!confirmed) {
+      return;
+    }
+    let archiveDirectory: string;
+    try {
+      archiveDirectory = requireWorkspaceExecutionDirectory({
+        workspaceId: workspace.workspaceId,
+        workspaceDirectory: workspace.workspaceDirectory,
       });
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Workspace path not available");
+      return;
+    }
 
-      if (!confirmed) {
-        return;
-      }
-      let archiveDirectory: string;
-      try {
-        archiveDirectory = requireWorkspaceExecutionDirectory({
-          workspaceId: workspace.workspaceId,
-          workspaceDirectory: workspace.workspaceDirectory,
-        });
-      } catch (error) {
-        toast.error(error instanceof Error ? error.message : "Workspace path not available");
-        return;
-      }
+    if (!archiveDirectory) {
+      toast.error("Workspace path not available");
+      return;
+    }
 
-      if (!archiveDirectory) {
-        toast.error("Workspace path not available");
-        return;
-      }
+    redirectAfterArchive();
 
-      redirectAfterArchive();
-
-      void archiveWorktree({
-        serverId: workspace.serverId,
-        cwd: archiveDirectory,
-        worktreePath: archiveDirectory,
-      }).catch((error) => {
-        const message = error instanceof Error ? error.message : "Failed to archive worktree";
-        toast.error(message);
-      });
-    })();
+    void archiveWorktree({
+      serverId: workspace.serverId,
+      cwd: archiveDirectory,
+      worktreePath: archiveDirectory,
+    }).catch((error) => {
+      const message = error instanceof Error ? error.message : "Failed to archive worktree";
+      toast.error(message);
+    });
   }, [archiveWorktree, isArchiving, redirectAfterArchive, toast, workspace]);
 
-  const handleArchiveWorkspace = useCallback(() => {
+  const handleArchiveWorktree = useCallback(() => {
+    void archiveWorktreeAfterConfirmation();
+  }, [archiveWorktreeAfterConfirmation]);
+
+  const hideWorkspaceAfterConfirmation = useCallback(async () => {
     if (isArchivingWorkspace) {
       return;
     }
 
-    void (async () => {
-      const confirmed = await confirmDialog({
-        title: "Hide workspace?",
-        message: `Hide "${workspace.name}" from the sidebar?\n\nFiles on disk will not be changed.`,
-        confirmLabel: "Hide",
-        cancelLabel: "Cancel",
-        destructive: true,
+    const confirmed = await confirmDialog({
+      title: "Hide workspace?",
+      message: `Hide "${workspace.name}" from the sidebar?\n\nFiles on disk will not be changed.`,
+      confirmLabel: "Hide",
+      cancelLabel: "Cancel",
+      destructive: true,
+    });
+    if (!confirmed) {
+      return;
+    }
+
+    const client = getHostRuntimeStore().getClient(workspace.serverId);
+    if (!client) {
+      toast.error("Host is not connected");
+      return;
+    }
+
+    setIsArchivingWorkspace(true);
+    try {
+      await archiveWorkspaceOptimistically({
+        client,
+        workspace,
+        afterHide: redirectAfterArchive,
       });
-      if (!confirmed) {
-        return;
-      }
-
-      const client = getHostRuntimeStore().getClient(workspace.serverId);
-      if (!client) {
-        toast.error("Host is not connected");
-        return;
-      }
-
-      setIsArchivingWorkspace(true);
-      void (async () => {
-        try {
-          await archiveWorkspaceOptimistically({
-            client,
-            workspace,
-            afterHide: redirectAfterArchive,
-          });
-        } catch (error) {
-          toast.error(error instanceof Error ? error.message : "Failed to hide workspace");
-        } finally {
-          setIsArchivingWorkspace(false);
-        }
-      })();
-    })();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Failed to hide workspace");
+    } finally {
+      setIsArchivingWorkspace(false);
+    }
   }, [isArchivingWorkspace, redirectAfterArchive, toast, workspace]);
+
+  const handleArchiveWorkspace = useCallback(() => {
+    void hideWorkspaceAfterConfirmation();
+  }, [hideWorkspaceAfterConfirmation]);
 
   const handleCopyPath = useCallback(() => {
     let copyTargetDirectory: string;
@@ -1589,7 +1608,7 @@ function WorkspaceRowWithMenu({
     priority: 0,
     handle: () => {
       if (isWorktree) {
-        handleArchiveWorktree();
+        void archiveWorktreeAfterConfirmation();
       } else {
         handleArchiveWorkspace();
       }

@@ -1,13 +1,15 @@
 import * as pty from "node-pty";
 import xterm, { type Terminal as TerminalType } from "@xterm/headless";
 import { randomUUID } from "crypto";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, statSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { createExternalProcessEnv } from "../server/paseo-env.js";
+import { writePrivateFileAtomicSync } from "../server/private-files.js";
 import type { TerminalCell, TerminalState } from "../shared/messages.js";
+import { TerminalInputModeTracker } from "../shared/terminal-input-mode.js";
 
 const { Terminal } = xterm;
 const require = createRequire(import.meta.url);
@@ -53,6 +55,7 @@ export interface TerminalSession {
   getSize(): { rows: number; cols: number };
   getState(): TerminalState;
   getStateSnapshot(): TerminalStateSnapshot;
+  getReplayPreamble(): string;
   getTitle(): string | undefined;
   getExitInfo(): TerminalExitInfo | null;
   kill(): void;
@@ -202,10 +205,13 @@ function prepareZshShellIntegrationRuntimeDir(sourceDir = resolveZshShellIntegra
   const runtimeDir = resolveZshShellIntegrationRuntimeDir();
   mkdirSync(runtimeDir, { recursive: true, mode: 0o700 });
   chmodSync(runtimeDir, 0o700);
-  copyFileSync(join(readableSourceDir, ".zshenv"), join(runtimeDir, ".zshenv"));
-  copyFileSync(
-    join(readableSourceDir, "paseo-integration.zsh"),
+  writePrivateFileAtomicSync(
+    join(runtimeDir, ".zshenv"),
+    readFileSync(join(readableSourceDir, ".zshenv")),
+  );
+  writePrivateFileAtomicSync(
     join(runtimeDir, "paseo-integration.zsh"),
+    readFileSync(join(readableSourceDir, "paseo-integration.zsh")),
   );
   return runtimeDir;
 }
@@ -215,6 +221,7 @@ export function buildTerminalEnvironment(
 ): Record<string, string> {
   const baseEnv: Record<string, string> = createExternalProcessEnv(process.env, input.env, {
     TERM: "xterm-256color",
+    TERM_PROGRAM: "kitty",
   });
 
   if (basename(input.shell) !== "zsh") {
@@ -547,6 +554,7 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
   let pendingInput = "";
   let inputFlushImmediate: ReturnType<typeof setImmediate> | null = null;
   let stateRevision = 0;
+  const inputModeTracker = new TerminalInputModeTracker();
 
   // Create xterm.js headless terminal
   const terminal = new Terminal({
@@ -699,6 +707,7 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
     }
     disposed = true;
     pendingInput = "";
+    inputModeTracker.reset();
     if (inputFlushImmediate) {
       clearImmediate(inputFlushImmediate);
       inputFlushImmediate = null;
@@ -731,6 +740,10 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
   // Pipe PTY output to terminal emulator
   ptyProcess.onData((data) => {
     if (killed) return;
+    const inputModeUpdate = inputModeTracker.feed(data);
+    for (const response of inputModeUpdate.responses) {
+      ptyProcess.write(response);
+    }
     recentOutputText = `${recentOutputText}${data}`;
     if (recentOutputText.length > TERMINAL_EXIT_OUTPUT_CHAR_LIMIT) {
       recentOutputText = recentOutputText.slice(-TERMINAL_EXIT_OUTPUT_CHAR_LIMIT);
@@ -797,6 +810,10 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
       rows: terminal.rows,
       cols: terminal.cols,
     };
+  }
+
+  function getReplayPreamble(): string {
+    return inputModeTracker.getPreamble();
   }
 
   function writeInputToPty(data: string): void {
@@ -1030,6 +1047,7 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
     getSize,
     getState,
     getStateSnapshot,
+    getReplayPreamble,
     getTitle,
     getExitInfo,
     kill,

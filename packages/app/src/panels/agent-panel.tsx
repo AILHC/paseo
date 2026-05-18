@@ -32,7 +32,6 @@ import {
 } from "@/hooks/use-agent-screen-state-machine";
 import { useArchiveAgent } from "@/hooks/use-archive-agent";
 import { useKeyboardShiftStyle } from "@/hooks/use-keyboard-shift-style";
-import { useStableEvent } from "@/hooks/use-stable-event";
 import { usePaneContext, usePaneFocus } from "@/panels/pane-context";
 import type { PanelDescriptor, PanelRegistration } from "@/panels/panel-registry";
 import {
@@ -48,18 +47,22 @@ import {
   deriveRouteBottomAnchorRequest,
 } from "@/screens/agent/agent-ready-screen-bottom-anchor";
 import { useCreateFlowStore } from "@/stores/create-flow-store";
-import { buildDraftStoreKey } from "@/stores/draft-keys";
+import { buildDraftStoreKey, generateDraftId } from "@/stores/draft-keys";
 import { usePanelStore } from "@/stores/panel-store";
 import { type Agent, useSessionStore } from "@/stores/session-store";
+import { useWorkspaceLayoutStore } from "@/stores/workspace-layout-store";
+import { buildWorkspaceTabPersistenceKey } from "@/stores/workspace-tabs-store";
 import type { Theme } from "@/styles/theme";
 import { SubagentsSection, useArchiveSubagent, useSubagentsForParent } from "@/subagents";
 import type { PendingPermission } from "@/types/shared";
 import type { StreamItem } from "@/types/stream";
 import { getInitDeferred, getInitKey } from "@/utils/agent-initialization";
 import { derivePendingPermissionKey, normalizeAgentSnapshot } from "@/utils/agent-snapshots";
+import type { WorkspaceFileOpenRequest } from "@/workspace/file-open";
 import { mergePendingCreateImages } from "@/utils/pending-create-images";
 import { navigateToAgent } from "@/utils/navigate-to-agent";
 import { deriveSidebarStateBucket } from "@/utils/sidebar-agent-state";
+import { buildDraftAgentSetup, type ClientSlashCommand } from "@/client-slash-commands";
 
 interface ChatAgentStateShape {
   serverId: string | null;
@@ -285,18 +288,12 @@ function AgentPanel() {
   const { isInteractive } = usePaneFocus();
   invariant(target.kind === "agent", "AgentPanel requires agent target");
 
-  function openWorkspaceFile(input: { filePath: string }) {
-    openFileInWorkspace(input.filePath);
-  }
-
-  const handleOpenWorkspaceFile = useStableEvent(openWorkspaceFile);
-
   return (
     <AgentPanelContent
       serverId={serverId}
       agentId={target.agentId}
       isPaneFocused={isInteractive}
-      onOpenWorkspaceFile={handleOpenWorkspaceFile}
+      onOpenWorkspaceFile={openFileInWorkspace}
     />
   );
 }
@@ -362,7 +359,7 @@ function AgentPanelContent({
   serverId: string;
   agentId: string;
   isPaneFocused: boolean;
-  onOpenWorkspaceFile?: (input: { filePath: string }) => void;
+  onOpenWorkspaceFile?: (request: WorkspaceFileOpenRequest) => void;
 }) {
   const resolvedAgentId = agentId.trim() || undefined;
   const resolvedServerId = serverId.trim() || undefined;
@@ -424,7 +421,7 @@ function AgentPanelBody({
   client: NonNullable<ReturnType<typeof useHostRuntimeClient>>;
   isConnected: boolean;
   connectionStatus: HostRuntimeConnectionStatus;
-  onOpenWorkspaceFile?: (input: { filePath: string }) => void;
+  onOpenWorkspaceFile?: (request: WorkspaceFileOpenRequest) => void;
 }) {
   const { isArchivingAgent: _isArchivingAgent } = useArchiveAgent();
   const hasSession = useSessionStore((state) => Boolean(state.sessions[serverId]));
@@ -589,7 +586,7 @@ function ChatAgentContent({
   client: NonNullable<ReturnType<typeof useHostRuntimeClient>>;
   isConnected: boolean;
   connectionStatus: HostRuntimeConnectionStatus;
-  onOpenWorkspaceFile?: (input: { filePath: string }) => void;
+  onOpenWorkspaceFile?: (request: WorkspaceFileOpenRequest) => void;
 }) {
   const panelToast = useToastHost();
   const { isArchivingAgent } = useArchiveAgent();
@@ -1038,7 +1035,7 @@ function AgentStreamSection({
   routeBottomAnchorRequest: RouteBottomAnchorRequest;
   hasAppliedAuthoritativeHistory: boolean;
   toast: ReturnType<typeof useToastHost>["api"];
-  onOpenWorkspaceFile?: (input: { filePath: string }) => void;
+  onOpenWorkspaceFile?: (request: WorkspaceFileOpenRequest) => void;
 }) {
   const streamItemsRaw = useSessionStore((state) =>
     agentId ? state.sessions[serverId]?.agentStreamTail?.get(agentId) : undefined,
@@ -1257,7 +1254,11 @@ function ActiveAgentComposer({
   const insets = useSafeAreaInsets();
   const isCompact = useIsCompactFormFactor();
   const paneContext = usePaneContext();
-  const { workspaceId } = paneContext;
+  const { workspaceId, tabId, retargetCurrentTab } = paneContext;
+  const { archiveAgent } = useArchiveAgent();
+  const closeWorkspaceTab = useWorkspaceLayoutStore((state) => state.closeTab);
+  const hideWorkspaceAgent = useWorkspaceLayoutStore((state) => state.hideAgent);
+  const unpinWorkspaceAgent = useWorkspaceLayoutStore((state) => state.unpinAgent);
   const subagentRows = useSubagentsForParent({
     serverId,
     parentAgentId: agentId,
@@ -1305,6 +1306,44 @@ function ActiveAgentComposer({
     [isCompact, openFileExplorerForCheckout, serverId, setExplorerTabForCheckout],
   );
 
+  const handleClientSlashCommand = useCallback(
+    async (command: ClientSlashCommand) => {
+      const agent = resolveChatAgentFromSession(useSessionStore.getState(), serverId, agentId);
+      if (!agent) {
+        throw new Error("Agent not found");
+      }
+
+      const workspaceKey = buildWorkspaceTabPersistenceKey({ serverId, workspaceId });
+      if (workspaceKey) {
+        unpinWorkspaceAgent(workspaceKey, agentId);
+        hideWorkspaceAgent(workspaceKey, agentId);
+      }
+
+      if (command.kind === "replace-agent-with-draft") {
+        retargetCurrentTab({
+          kind: "draft",
+          draftId: generateDraftId(),
+          setup: buildDraftAgentSetup(agent),
+        });
+      } else if (workspaceKey) {
+        closeWorkspaceTab(workspaceKey, tabId);
+      }
+
+      await archiveAgent({ serverId, agentId });
+    },
+    [
+      agentId,
+      archiveAgent,
+      closeWorkspaceTab,
+      hideWorkspaceAgent,
+      retargetCurrentTab,
+      serverId,
+      tabId,
+      unpinWorkspaceAgent,
+      workspaceId,
+    ],
+  );
+
   const inputAreaStyle = useMemo(
     () => [styles.inputAreaWrapper, { paddingBottom: insets.bottom }],
     [insets.bottom],
@@ -1336,6 +1375,7 @@ function ActiveAgentComposer({
         onAddImages={onAddImages}
         onComposerHeightChange={onComposerHeightChange}
         onMessageSent={onMessageSent}
+        onClientSlashCommand={handleClientSlashCommand}
       />
     </View>
   );
