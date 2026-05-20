@@ -58,6 +58,29 @@ import { IMPORTABLE_PROVIDERS } from "./provider-registry.js";
 
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
+const ARCHIVE_SESSION_COMMAND: AgentSlashCommand = {
+  name: "archive-session",
+  description: "Archive this session",
+  argumentHint: "",
+};
+
+function getPromptText(prompt: AgentPromptInput): string | null {
+  if (typeof prompt === "string") return prompt.trim();
+  if (prompt.length !== 1) return null;
+  const [block] = prompt;
+  return block.type === "text" ? block.text.trim() : null;
+}
+
+export function isArchiveSessionPrompt(prompt: AgentPromptInput): boolean {
+  return getPromptText(prompt) === "/archive-session";
+}
+
+function isNativeUnarchiveIdempotentError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /already[-_\s]?unarchived|not[-_\s]?archived|nothing[-_\s]?to[-_\s]?restore|is not archived/i.test(
+    message,
+  );
+}
 const STORED_AGENT_CAPABILITIES: AgentCapabilityFlags = {
   supportsStreaming: false,
   supportsSessionPersistence: true,
@@ -673,6 +696,55 @@ export class AgentManager {
     );
   }
 
+  async syncNativeArchivedStateForStoredAgents(options?: { cwd?: string }): Promise<void> {
+    const registry = this.requireRegistry();
+    const records = await registry.list();
+    const candidates = records.filter((record) => {
+      if (!record.persistence || record.archivedAt) return false;
+      if (this.getAgent(record.id)) return false;
+      if (options?.cwd && record.cwd !== options.cwd) return false;
+      return true;
+    });
+
+    const byProvider = new Map<AgentProvider, StoredAgentRecord[]>();
+    for (const record of candidates) {
+      const group = byProvider.get(record.provider) ?? [];
+      group.push(record);
+      byProvider.set(record.provider, group);
+    }
+
+    for (const [provider, providerRecords] of byProvider) {
+      const client = this.clients.get(provider);
+      if (!client?.listPersistedAgents) continue;
+      let descriptors: PersistedAgentDescriptor[];
+      try {
+        descriptors = await client.listPersistedAgents({ limit: 500, cwd: options?.cwd });
+      } catch (error) {
+        this.logger.warn({ err: error, provider }, "Failed to list native persisted agents");
+        continue;
+      }
+      const archivedByHandle = new Map<string, PersistedAgentDescriptor>();
+      for (const descriptor of descriptors) {
+        if (!descriptor.archivedAt) continue;
+        archivedByHandle.set(descriptor.sessionId, descriptor);
+        archivedByHandle.set(descriptor.persistence.sessionId, descriptor);
+        if (descriptor.persistence.nativeHandle) {
+          archivedByHandle.set(descriptor.persistence.nativeHandle, descriptor);
+        }
+      }
+      for (const record of providerRecords) {
+        const sessionId = record.persistence?.sessionId;
+        const nativeHandle = record.persistence?.nativeHandle;
+        const descriptor =
+          (sessionId ? archivedByHandle.get(sessionId) : undefined) ??
+          (nativeHandle ? archivedByHandle.get(nativeHandle) : undefined);
+        if (descriptor) {
+          await this.markRecordArchived(record);
+        }
+      }
+    }
+  }
+
   async listProviderAvailability(): Promise<ProviderAvailability[]> {
     const checks = Array.from(this.clients.keys()).map(async (provider) => {
       const client = this.clients.get(provider);
@@ -737,6 +809,19 @@ export class AgentManager {
         );
       }
     }
+  }
+
+  async listCommandsForAgent(agentId: string): Promise<AgentSlashCommand[]> {
+    const agent = this.requireSessionAgent(agentId);
+    const providerCommands = agent.session.listCommands ? await agent.session.listCommands() : [];
+    const seen = new Set<string>();
+    return [ARCHIVE_SESSION_COMMAND, ...providerCommands].filter((command) => {
+      if (seen.has(command.name)) {
+        return false;
+      }
+      seen.add(command.name);
+      return true;
+    });
   }
 
   async listDraftFeatures(config: AgentSessionConfig): Promise<AgentFeature[]> {
@@ -1041,6 +1126,10 @@ export class AgentManager {
   }
 
   async archiveAgent(agentId: string): Promise<{ archivedAt: string }> {
+    return await this.archiveSession(agentId);
+  }
+
+  async archiveSession(agentId: string): Promise<{ archivedAt: string }> {
     const agent = this.requireAgent(agentId);
     if (!this.registry) {
       throw new Error("Agent storage is not configured");
@@ -1055,6 +1144,7 @@ export class AgentManager {
     }
 
     const { archivedAt } = await this.markRecordArchived(stored);
+    await this.archiveNativeSessionBestEffort(stored.provider, stored.persistence);
     await this.closeAgent(agentId);
 
     await this.cascadeArchiveChildren(agentId);
@@ -1081,9 +1171,10 @@ export class AgentManager {
         continue;
       }
       if (this.agents.has(record.id)) {
-        await this.archiveAgent(record.id);
+        await this.archiveSession(record.id);
       } else {
         await this.markRecordArchived(record);
+        await this.archiveNativeSessionBestEffort(record.provider, record.persistence);
         await this.cascadeArchiveChildren(record.id);
       }
     }
@@ -1095,8 +1186,6 @@ export class AgentManager {
     const archivedRecord = buildArchivedAgentRecord(record, { archivedAt, updatedAt: archivedAt });
 
     await registry.upsert(archivedRecord);
-
-    await this.archiveNativeSessionBestEffort(record.provider, record.persistence);
 
     if (this.agents.has(record.id)) {
       this.notifyAgentState(record.id);
@@ -1268,12 +1357,28 @@ export class AgentManager {
       throw new Error(`Agent not found: ${agentId}`);
     }
 
-    const nextRecord = buildArchivedAgentRecord(record, { archivedAt });
-    await registry.upsert(nextRecord);
+    void archivedAt;
+    const snapshotRecord = {
+      ...record,
+      archivedAt: record.archivedAt ?? null,
+    };
+    await registry.upsert(snapshotRecord);
+    return snapshotRecord;
+  }
 
+  async archiveSessionSnapshot(agentId: string, archivedAt: string): Promise<StoredAgentRecord> {
+    const registry = this.requireRegistry();
+    const record = await registry.get(agentId);
+    if (!record) {
+      throw new Error(`Agent not found: ${agentId}`);
+    }
+    const archivedRecord = buildArchivedAgentRecord(record, { archivedAt });
+    await registry.upsert(archivedRecord);
     await this.archiveNativeSessionBestEffort(record.provider, record.persistence);
-
-    return nextRecord;
+    if (!archivedRecord.internal) {
+      this.dispatchArchivedStoredAgent(archivedRecord);
+    }
+    return archivedRecord;
   }
 
   async unarchiveSnapshot(agentId: string): Promise<boolean> {
@@ -1292,6 +1397,40 @@ export class AgentManager {
       this.notifyAgentState(agentId);
     }
     return true;
+  }
+
+  async unarchiveSession(agentId: string): Promise<boolean> {
+    const registry = this.requireRegistry();
+    const record = await registry.get(agentId);
+    if (!record || !record.archivedAt) {
+      return false;
+    }
+    await this.unarchiveNativeSession(record.provider, record.persistence);
+    return await this.unarchiveSnapshot(agentId);
+  }
+
+  private async unarchiveNativeSession(
+    provider: AgentProvider,
+    persistence: AgentPersistenceHandle | null | undefined,
+  ): Promise<void> {
+    if (!persistence) return;
+    const client = this.clients.get(provider);
+    if (!client?.unarchiveNativeSession) {
+      this.logger.info(
+        { provider, sessionId: persistence.sessionId },
+        "Provider has no native unarchive",
+      );
+      return;
+    }
+    try {
+      await client.unarchiveNativeSession(persistence);
+    } catch (error) {
+      if (isNativeUnarchiveIdempotentError(error)) {
+        this.logger.debug({ err: error, provider }, "Native session is already unarchived");
+        return;
+      }
+      throw error;
+    }
   }
 
   async unarchiveSnapshotByHandle(handle: AgentPersistenceHandle): Promise<void> {

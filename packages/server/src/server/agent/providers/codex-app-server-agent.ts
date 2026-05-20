@@ -727,19 +727,9 @@ const CodexModelListResponseSchema = z.object({
     .optional(),
 });
 
-function filterCodexThreadsByCwd(
-  threads: Array<Record<string, unknown>>,
-  cwd: string | undefined,
-): Array<Record<string, unknown>> {
-  if (!cwd) {
-    return threads;
-  }
-  // thread/list rows carry an optional cwd. The descriptor builder later
-  // falls back to process.cwd() if the field is missing, so we only match
-  // here when the row genuinely carries a cwd string — otherwise threads
-  // with no cwd would falsely match the daemon's own cwd.
-  const matchesCwd = createPathEquivalenceMatcher(cwd);
-  return threads.filter((thread) => typeof thread.cwd === "string" && matchesCwd(thread.cwd));
+function readCodexArchivedAt(thread: Record<string, unknown>): Date | null {
+  const value = thread.archivedAt ?? thread.archived_at;
+  return typeof value === "number" ? new Date(value * 1000) : null;
 }
 
 function toAgentUsage(tokenUsage: unknown): AgentUsage | undefined {
@@ -5200,11 +5190,34 @@ export class CodexAppServerAgentClient implements AgentClient {
       // hydration below only runs for matching threads. Fetch a wider window
       // when filtering since most threads will be from other cwds.
       const listLimit = options?.cwd ? Math.max(limit, 50) : limit;
-      const response = toObjectRecord(await client.request("thread/list", { limit: listLimit }));
-      const allThreads = Array.isArray(response?.data) ? response.data.filter(isRecord) : [];
-      const threads = filterCodexThreadsByCwd(allThreads, options?.cwd);
+      const activeResponse = toObjectRecord(
+        await client.request("thread/list", { limit: listLimit }),
+      );
+      const archivedResponse = toObjectRecord(
+        await client.request("thread/list", { limit: listLimit, archived: true }),
+      );
+      const activeThreads = Array.isArray(activeResponse?.data)
+        ? activeResponse.data
+            .filter(isRecord)
+            .map((thread) => ({ thread, archivedAt: null as Date | null }))
+        : [];
+      const archivedThreads = Array.isArray(archivedResponse?.data)
+        ? archivedResponse.data.filter(isRecord).map((thread) => ({
+            thread,
+            archivedAt: readCodexArchivedAt(thread),
+          }))
+        : [];
+      const cwdMatcher = options?.cwd ? createPathEquivalenceMatcher(options.cwd) : null;
+      const filterByCwd = (entries: typeof activeThreads): typeof activeThreads =>
+        entries.filter(
+          ({ thread }) => !cwdMatcher || (typeof thread.cwd === "string" && cwdMatcher(thread.cwd)),
+        );
+      const threads = [
+        ...filterByCwd(activeThreads).slice(0, limit),
+        ...filterByCwd(archivedThreads).slice(0, limit),
+      ];
       const descriptors: PersistedAgentDescriptor[] = await Promise.all(
-        threads.slice(0, limit).map(async (thread) => {
+        threads.map(async ({ thread, archivedAt }) => {
           const threadId = typeof thread.id === "string" ? thread.id : "";
           const cwd = typeof thread.cwd === "string" ? thread.cwd : process.cwd();
           const title = typeof thread.preview === "string" ? thread.preview : null;
@@ -5244,6 +5257,7 @@ export class CodexAppServerAgentClient implements AgentClient {
               },
             },
             timeline: timeline.map((entry) => entry.item),
+            archivedAt,
           };
         }),
       );
@@ -5296,6 +5310,24 @@ export class CodexAppServerAgentClient implements AgentClient {
       await client.request("initialize", buildCodexAppServerInitializeParams());
       client.notify("initialized", {});
       await client.request("thread/archive", { threadId });
+    } finally {
+      await client.dispose();
+    }
+  }
+
+  async unarchiveNativeSession(handle: AgentPersistenceHandle): Promise<void> {
+    const threadId = handle.nativeHandle ?? handle.sessionId;
+    if (!threadId) return;
+
+    const child = await this.spawnAppServer();
+    const client =
+      this.deps._createCodexClient?.(child, this.logger, () => ({})) ??
+      new CodexAppServerClient(child, this.logger);
+
+    try {
+      await client.request("initialize", buildCodexAppServerInitializeParams());
+      client.notify("initialized", {});
+      await client.request("thread/unarchive", { threadId });
     } finally {
       await client.dispose();
     }

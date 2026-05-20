@@ -2293,111 +2293,20 @@ export class Session {
   }
 
   private async handleArchiveAgentRequest(agentId: string, requestId: string): Promise<void> {
-    this.sessionLogger.info({ agentId }, `Archiving agent ${agentId}`);
-
-    const { archivedAt } = await this.archiveAgentForClose(agentId);
-
-    this.emit({
-      type: "agent_archived",
-      payload: {
-        agentId,
-        archivedAt,
-        requestId,
-      },
-    });
-  }
-
-  private async archiveStoredAgentForClose(
-    agentId: string,
-  ): Promise<{ agentId: string; archivedAt: string }> {
-    const existing = await this.agentStorage.get(agentId);
-    if (!existing) {
-      throw new Error(`Agent not found: ${agentId}`);
-    }
-
-    if (existing.archivedAt) {
-      return {
-        agentId,
-        archivedAt: existing.archivedAt,
-      };
-    }
-
-    const archivedAt = new Date().toISOString();
-    await this.agentManager.archiveSnapshot(agentId, archivedAt);
-
-    return { agentId, archivedAt };
-  }
-
-  private async archiveAgentForClose(
-    agentId: string,
-  ): Promise<{ agentId: string; archivedAt: string }> {
-    const liveAgent = this.agentManager.getAgent(agentId);
-    if (liveAgent) {
-      await this.interruptAgentIfRunning(agentId);
-      await this.agentManager.clearAgentAttention(agentId).catch(() => undefined);
-      await this.agentManager.archiveAgent(agentId);
-    } else {
-      await this.archiveStoredAgentForClose(agentId);
-    }
-
-    const archivedRecord = await this.agentStorage.get(agentId);
-    if (!archivedRecord) {
-      throw new Error(`Agent not found in storage after archive: ${agentId}`);
-    }
-
-    if (this.agentUpdatesSubscription) {
-      const payload = this.buildStoredAgentPayload(archivedRecord);
-      const project = await this.buildProjectPlacementForCwd(payload.cwd);
-      if (project) {
-        const matches = this.matchesAgentFilter({
-          agent: payload,
-          project,
-          filter: this.agentUpdatesSubscription.filter,
-        });
-        this.bufferOrEmitAgentUpdate(
-          this.agentUpdatesSubscription,
-          matches
-            ? {
-                kind: "upsert",
-                agent: payload,
-                project,
-              }
-            : {
-                kind: "remove",
-                agentId,
-              },
-        );
-      } else {
-        this.bufferOrEmitAgentUpdate(this.agentUpdatesSubscription, {
-          kind: "remove",
-          agentId,
-        });
-      }
-      await this.emitWorkspaceUpdateForCwd(payload.cwd);
-    }
-
-    if (!archivedRecord.archivedAt) {
-      throw new Error(`Agent missing archivedAt after archive: ${agentId}`);
-    }
-
-    return { agentId, archivedAt: archivedRecord.archivedAt };
+    this.sessionLogger.info(
+      { agentId, requestId },
+      "Ignoring disabled archive_agent_request; use /archive-session",
+    );
+    throw new Error("archive_agent_request is disabled; use /archive-session");
   }
 
   private async handleCloseItemsRequest(msg: CloseItemsRequest): Promise<void> {
-    const archiveResults = await Promise.allSettled(
-      msg.agentIds.map((agentId) => this.archiveAgentForClose(agentId)),
-    );
-    const agents = [];
-    for (let i = 0; i < archiveResults.length; i += 1) {
-      const result = archiveResults[i];
-      if (result.status === "fulfilled") {
-        agents.push(result.value);
-      } else {
-        this.sessionLogger.warn(
-          { err: result.reason, agentId: msg.agentIds[i], requestId: msg.requestId },
-          "Failed to archive agent during close_items batch",
-        );
-      }
+    const agents: Array<{ agentId: string; archivedAt: string }> = [];
+    for (const agentId of msg.agentIds) {
+      this.sessionLogger.debug(
+        { agentId, requestId: msg.requestId },
+        "Ignoring agent id during close_items_request",
+      );
     }
 
     const terminals = [];
@@ -4428,8 +4337,8 @@ export class Session {
       const agents = this.agentManager.listAgents();
       const agent = agents.find((a) => a.id === agentId);
 
-      if (agent?.session?.listCommands) {
-        const commands = await agent.session.listCommands();
+      if (agent?.session) {
+        const commands = await this.agentManager.listCommandsForAgent(agentId);
         this.emit({
           type: "list_commands_response",
           payload: {
@@ -5987,6 +5896,12 @@ export class Session {
         : request.filter;
     const scope = request.type === "fetch_agents_request" ? request.scope : undefined;
     const sort = this.agentsPager.normalizeSort(request.sort);
+
+    try {
+      await this.agentManager.syncNativeArchivedStateForStoredAgents();
+    } catch (error) {
+      this.sessionLogger.warn({ err: error }, "Failed to sync native archived agent state");
+    }
 
     let agents = await this.listAgentPayloads({
       labels: filter?.labels,

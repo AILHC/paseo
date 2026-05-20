@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import { AgentManager } from "./agent-manager.js";
 import { AgentStorage } from "./agent-storage.js";
+import { sendPromptToAgent } from "./agent-prompt.js";
 import { PARENT_AGENT_ID_LABEL } from "../../shared/agent-labels.js";
 import type { StoredAgentRecord } from "./agent-storage.js";
 import type {
@@ -1626,49 +1627,237 @@ test("runAgent persists finished attention and idle status without an external s
   expect(persisted?.attentionTimestamp).toEqual(expect.any(String));
 });
 
-test("archiveSnapshot clears persisted attention and normalizes running status", async () => {
-  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-archive-attention-"));
-  const storagePath = join(workdir, "agents");
-  const storage = new AgentStorage(storagePath, logger);
+test("archiveSnapshot persists the latest snapshot without archiving", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-snapshot-no-archive-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
   const manager = new AgentManager({
     clients: {
       codex: new TestAgentClient(),
     },
     registry: storage,
     logger,
-    idFactory: () => "00000000-0000-4000-8000-000000000135",
   });
 
   const snapshot = await manager.createAgent({
     provider: "codex",
     cwd: workdir,
-    title: "Archive attention test",
   });
 
-  const live = manager.getAgent(snapshot.id);
-  expect(live).not.toBeNull();
-  live!.lifecycle = "running";
-  live!.attention = {
-    requiresAttention: true,
-    attentionReason: "finished",
-    attentionTimestamp: new Date("2025-01-02T00:00:00.000Z"),
-  };
+  const record = await manager.archiveSnapshot(snapshot.id, "2026-05-20T00:00:00.000Z");
 
-  const archivedAt = "2025-01-03T00:00:00.000Z";
-  const archivedRecord = await manager.archiveSnapshot(snapshot.id, archivedAt);
+  expect(record.archivedAt).toBeNull();
+  expect((await storage.get(snapshot.id))?.archivedAt).toBeNull();
+});
 
-  expect(archivedRecord.archivedAt).toBe(archivedAt);
-  expect(archivedRecord.lastStatus).toBe("idle");
-  expect(archivedRecord.requiresAttention).toBe(false);
-  expect(archivedRecord.attentionReason).toBeNull();
-  expect(archivedRecord.attentionTimestamp).toBeNull();
+test("archiveSession writes Paseo archive before best-effort native archive", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-archive-session-order-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const calls: string[] = [];
 
-  const persisted = await storage.get(snapshot.id);
-  expect(persisted?.archivedAt).toBe(archivedAt);
-  expect(persisted?.lastStatus).toBe("idle");
-  expect(persisted?.requiresAttention).toBe(false);
-  expect(persisted?.attentionReason).toBeNull();
-  expect(persisted?.attentionTimestamp).toBeNull();
+  let agentId = "";
+  class NativeArchiveClient extends TestAgentClient {
+    override async archiveNativeSession(handle: AgentPersistenceHandle): Promise<void> {
+      calls.push(`native:${handle.sessionId}`);
+      const stored = await storage.get(agentId);
+      expect(stored?.archivedAt).toEqual(expect.any(String));
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: { codex: new NativeArchiveClient() },
+    registry: storage,
+    logger,
+  });
+
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir });
+  agentId = agent.id;
+
+  await manager.archiveSession(agent.id);
+
+  expect(calls).toEqual([`native:${agent.persistence?.sessionId}`]);
+  expect((await storage.get(agent.id))?.archivedAt).toEqual(expect.any(String));
+});
+
+test("archiveSession keeps Paseo archived when native archive fails", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-archive-native-fails-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+
+  class FailingNativeArchiveClient extends TestAgentClient {
+    override async archiveNativeSession(): Promise<void> {
+      throw new Error("native archive failed");
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: { codex: new FailingNativeArchiveClient() },
+    registry: storage,
+    logger,
+  });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir });
+
+  await manager.archiveSession(agent.id);
+
+  expect((await storage.get(agent.id))?.archivedAt).toEqual(expect.any(String));
+});
+
+test("listCommandsForAgent includes archive-session for live agents", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-list-archive-session-command-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    registry: storage,
+    logger,
+  });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir });
+
+  const commands = await manager.listCommandsForAgent(agent.id);
+
+  expect(commands).toEqual(
+    expect.arrayContaining([
+      { name: "archive-session", description: "Archive this session", argumentHint: "" },
+    ]),
+  );
+});
+
+test("sendPromptToAgent handles archive-session before recording a user message", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-prompt-archive-session-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    registry: storage,
+    logger,
+  });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir });
+  const recordUserMessageSpy = vi.spyOn(manager, "recordUserMessage");
+
+  const result = await sendPromptToAgent({
+    agentManager: manager,
+    agentStorage: storage,
+    agentId: agent.id,
+    prompt: "/archive-session",
+    userMessageText: "/archive-session",
+    logger,
+  });
+
+  expect(result).toEqual({ outOfBand: true });
+  expect(recordUserMessageSpy).not.toHaveBeenCalled();
+  expect((await storage.get(agent.id))?.archivedAt).toEqual(expect.any(String));
+});
+
+test("unarchiveSession calls native unarchive before clearing Paseo archivedAt", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-unarchive-native-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const calls: string[] = [];
+
+  class NativeUnarchiveClient extends TestAgentClient {
+    override async unarchiveNativeSession(handle: AgentPersistenceHandle): Promise<void> {
+      calls.push(handle.sessionId);
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: { codex: new NativeUnarchiveClient() },
+    registry: storage,
+    logger,
+  });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir });
+  await manager.archiveSession(agent.id);
+
+  await manager.unarchiveSession(agent.id);
+
+  expect(calls).toEqual([agent.persistence?.sessionId]);
+  expect((await storage.get(agent.id))?.archivedAt).toBeNull();
+});
+
+test("unarchiveSession keeps Paseo archived when native unarchive fails with a real error", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-unarchive-native-real-error-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+
+  class FailingNativeUnarchiveClient extends TestAgentClient {
+    override async unarchiveNativeSession(): Promise<void> {
+      throw new Error("permission denied");
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: { codex: new FailingNativeUnarchiveClient() },
+    registry: storage,
+    logger,
+  });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir });
+  await manager.archiveSession(agent.id);
+
+  await expect(manager.unarchiveSession(agent.id)).rejects.toThrow("permission denied");
+  expect((await storage.get(agent.id))?.archivedAt).toEqual(expect.any(String));
+});
+
+test("unarchiveSession clears Paseo archive for native not-archived idempotent errors", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-unarchive-native-idempotent-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+
+  class IdempotentNativeUnarchiveClient extends TestAgentClient {
+    override async unarchiveNativeSession(): Promise<void> {
+      throw new Error("thread is not archived");
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: { codex: new IdempotentNativeUnarchiveClient() },
+    registry: storage,
+    logger,
+  });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir });
+  await manager.archiveSession(agent.id);
+
+  await manager.unarchiveSession(agent.id);
+
+  expect((await storage.get(agent.id))?.archivedAt).toBeNull();
+});
+
+test("syncNativeArchivedStateForStoredAgents archives only non-live stored records", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-native-sync-non-live-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+
+  class ArchivedDescriptorClient extends TestAgentClient {
+    override async listPersistedAgents(): Promise<PersistedAgentDescriptor[]> {
+      return [
+        {
+          provider: "codex",
+          sessionId: "native-stored",
+          cwd: workdir,
+          title: "Archived native",
+          lastActivityAt: new Date("2026-05-20T00:00:00.000Z"),
+          persistence: {
+            provider: "codex",
+            sessionId: "native-stored",
+            nativeHandle: "native-stored",
+          },
+          timeline: [],
+          archivedAt: new Date("2026-05-20T00:00:00.000Z"),
+        },
+      ];
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: { codex: new ArchivedDescriptorClient() },
+    registry: storage,
+    logger,
+  });
+  const live = await manager.createAgent({ provider: "codex", cwd: workdir });
+  const stored = await manager.createAgent({ provider: "codex", cwd: workdir });
+  await storage.upsert({
+    ...(await storage.get(stored.id))!,
+    persistence: { provider: "codex", sessionId: "native-stored", nativeHandle: "native-stored" },
+    archivedAt: null,
+  });
+  (manager as unknown as { agents: Map<string, unknown> }).agents.delete(stored.id);
+
+  await manager.syncNativeArchivedStateForStoredAgents({ cwd: workdir });
+
+  expect((await storage.get(stored.id))?.archivedAt).toEqual(expect.any(String));
+  expect(manager.getAgent(live.id)).not.toBeNull();
+  expect((await storage.get(live.id))?.archivedAt ?? null).toBeNull();
 });
 
 test("reloadAgentSession cancels active run and resumes existing session once thread_started is observed", async () => {

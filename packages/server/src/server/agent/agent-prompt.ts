@@ -1,7 +1,7 @@
 import type { Logger } from "pino";
 
 import type { AgentPromptInput, AgentRunOptions } from "./agent-sdk-types.js";
-import type { AgentManager } from "./agent-manager.js";
+import { isArchiveSessionPrompt, type AgentManager } from "./agent-manager.js";
 import type { AgentStorage } from "./agent-storage.js";
 import { ensureAgentLoaded } from "./agent-loading.js";
 
@@ -93,14 +93,7 @@ export async function unarchiveAgentState(
   if (!record || !record.archivedAt) {
     return false;
   }
-  const updatedAt = new Date().toISOString();
-  await agentStorage.upsert({
-    ...record,
-    archivedAt: null,
-    updatedAt,
-  });
-  agentManager.notifyAgentState(agentId);
-  return true;
+  return await agentManager.unarchiveSession(agentId);
 }
 
 /**
@@ -176,6 +169,11 @@ export async function sendPromptToAgent(
 
   if (params.sessionMode) {
     await params.agentManager.setAgentMode(params.agentId, params.sessionMode);
+  }
+
+  if (isArchiveSessionPrompt(params.prompt)) {
+    await params.agentManager.archiveSession(params.agentId);
+    return { outOfBand: true };
   }
 
   if (recordUserMessage && params.userMessageText !== undefined) {

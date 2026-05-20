@@ -408,6 +408,8 @@ function wrapClientProvider(
         profileModelsAreAdditive,
       }),
     listModes: inner.listModes?.bind(inner),
+    listCommands: inner.listCommands?.bind(inner),
+    listFeatures: inner.listFeatures?.bind(inner),
     listPersistedAgents: listPersistedAgents
       ? async (options?: ListPersistedAgentsOptions) =>
           (await listPersistedAgents(options)).map((descriptor) =>
@@ -416,6 +418,8 @@ function wrapClientProvider(
       : undefined,
     isAvailable: () => inner.isAvailable(),
     getDiagnostic: inner.getDiagnostic?.bind(inner),
+    archiveNativeSession: inner.archiveNativeSession?.bind(inner),
+    unarchiveNativeSession: inner.unarchiveNativeSession?.bind(inner),
   };
 }
 

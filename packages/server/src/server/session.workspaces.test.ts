@@ -66,6 +66,7 @@ interface SessionTestAccess {
   agentManager: {
     listAgents(): unknown[];
     listImportablePersistedAgents(options?: unknown): Promise<PersistedAgentDescriptor[]>;
+    syncNativeArchivedStateForStoredAgents(options?: unknown): Promise<void>;
   };
   workspaceRegistry: {
     list(...args: unknown[]): Promise<unknown[]>;
@@ -853,7 +854,7 @@ test("agent_update emits fallback placement when no workspace is registered", as
   });
 });
 
-test("archive emits an authoritative agent_update upsert for subscribed clients", async () => {
+test("archive_agent_request is disabled and does not archive the agent", async () => {
   const emitted: SessionOutboundMessage[] = [];
   const archivedRecord = {
     id: "agent-1",
@@ -997,26 +998,26 @@ test("archive emits an authoritative agent_update upsert for subscribed clients"
     pendingUpdatesByAgentId: new Map(),
   };
 
-  await session.handleArchiveAgentRequest("agent-1", "req-archive");
+  const archivedAtBefore = (await session.agentStorage.get("agent-1"))?.archivedAt ?? null;
 
-  const update = emitted.find((message) => message.type === "agent_update");
-  expect(update?.payload).toMatchObject({
-    kind: "upsert",
-    agent: {
-      id: "agent-1",
-      archivedAt: expect.any(String),
-    },
-  });
-  expect(emitted.find((message) => message.type === "agent_archived")?.payload).toMatchObject({
+  await session.handleMessage({
+    type: "archive_agent_request",
     agentId: "agent-1",
-    archivedAt: expect.any(String),
-    requestId: "req-archive",
+    requestId: "req-archive-disabled",
   });
+
+  expect(emitted.find((message) => message.type === "agent_archived")).toBeUndefined();
+  expect(emitted.find((message) => message.type === "agent_update")).toBeUndefined();
+  expect(emitted.find((message) => message.type === "rpc_error")?.payload).toMatchObject({
+    requestId: "req-archive-disabled",
+    requestType: "archive_agent_request",
+    code: "handler_error",
+  });
+  expect((await session.agentStorage.get("agent-1"))?.archivedAt ?? null).toBe(archivedAtBefore);
 });
 
-test("close_items_request archives agents and kills terminals in one batch", async () => {
+test("close_items_request ignores agents and still kills terminals", async () => {
   const emitted: SessionOutboundMessage[] = [];
-  const archivedAt = "2026-04-01T00:00:00.000Z";
   const sessionLogger = {
     child: () => sessionLogger,
     trace: vi.fn(),
@@ -1069,7 +1070,9 @@ test("close_items_request archives agents and kills terminals in one batch", asy
         subscribe: () => () => {},
         listAgents: () => [],
         getAgent: (agentId: string) => (agentId === "agent-1" ? { id: agentId } : null),
-        archiveAgent: async () => ({ archivedAt }),
+        archiveAgent: async () => {
+          throw new Error("archiveAgent should not be called");
+        },
         clearAgentAttention: async () => {},
         notifyAgentState: () => {},
       }),
@@ -1079,8 +1082,6 @@ test("close_items_request archives agents and kills terminals in one batch", asy
           if (agentId !== "agent-1") {
             return null;
           }
-          archivedRecord.archivedAt = archivedAt;
-          archivedRecord.updatedAt = archivedAt;
           return archivedRecord;
         },
       }),
@@ -1171,23 +1172,18 @@ test("close_items_request archives agents and kills terminals in one batch", asy
     requestId: "req-close-items",
   });
 
-  expect(interruptAgentIfRunning).toHaveBeenCalledWith("agent-1");
+  expect(interruptAgentIfRunning).not.toHaveBeenCalled();
   expect(killTerminal).toHaveBeenCalledWith("term-1");
   expect(emitted.find((message) => message.type === "close_items_response")?.payload).toEqual({
-    agents: [{ agentId: "agent-1", archivedAt }],
+    agents: [],
     terminals: [{ terminalId: "term-1", success: true }],
     requestId: "req-close-items",
   });
-  expect(emitted.find((message) => message.type === "agent_update")?.payload).toMatchObject({
-    kind: "upsert",
-    agent: {
-      id: "agent-1",
-      archivedAt,
-    },
-  });
+  expect(emitted.find((message) => message.type === "agent_update")).toBeUndefined();
+  expect((await session.agentStorage.get("agent-1"))?.archivedAt ?? null).toBeNull();
 });
 
-test("close_items_request archives stored agents that are not currently loaded", async () => {
+test("close_items_request ignores stored agents that are not currently loaded", async () => {
   const emitted: SessionOutboundMessage[] = [];
   const sessionLogger = {
     child: () => sessionLogger,
@@ -1197,7 +1193,6 @@ test("close_items_request archives stored agents that are not currently loaded",
     warn: vi.fn(),
     error: vi.fn(),
   };
-  const liveArchivedAt = "2026-04-01T00:00:00.000Z";
   const storedAgentId = "agent-stored";
   const liveRecord = {
     ...makeAgent({
@@ -1240,22 +1235,11 @@ test("close_items_request archives stored agents that are not currently loaded",
         subscribe: () => () => {},
         listAgents: () => [],
         getAgent: (agentId: string) => (agentId === "agent-live" ? { id: agentId } : null),
-        archiveAgent: async (agentId: string) => {
-          if (agentId !== "agent-live") {
-            throw new Error(`Unexpected live archive: ${agentId}`);
-          }
-          liveRecord.archivedAt = liveArchivedAt;
-          liveRecord.updatedAt = liveArchivedAt;
-          return { archivedAt: liveArchivedAt };
+        archiveAgent: async () => {
+          throw new Error("archiveAgent should not be called");
         },
-        archiveSnapshot: async (_agentId: string, archivedAt: string) => {
-          storedRecord.archivedAt = archivedAt;
-          storedRecord.updatedAt = archivedAt;
-          storedRecord.status = "completed";
-          storedRecord.requiresAttention = false;
-          storedRecord.attentionReason = null;
-          storedRecord.attentionTimestamp = null;
-          return storedRecord;
+        archiveSnapshot: async () => {
+          throw new Error("archiveSnapshot should not be called");
         },
         clearAgentAttention: async () => {},
         notifyAgentState: () => {},
@@ -1356,19 +1340,17 @@ test("close_items_request archives stored agents that are not currently loaded",
     requestId: "req-close-stored",
   });
 
-  expect(storedRecord.archivedAt).toEqual(expect.any(String));
+  expect(storedRecord.archivedAt).toBeNull();
+  expect(liveRecord.archivedAt).toBeNull();
   expect(emitted.find((message) => message.type === "close_items_response")?.payload).toEqual({
-    agents: [
-      { agentId: "agent-live", archivedAt: liveArchivedAt },
-      { agentId: storedAgentId, archivedAt: storedRecord.archivedAt },
-    ],
+    agents: [],
     terminals: [],
     requestId: "req-close-stored",
   });
   expect(sessionLogger.warn).not.toHaveBeenCalled();
 });
 
-test("close_items_request continues after an archive failure", async () => {
+test("close_items_request continues after a terminal failure", async () => {
   const emitted: SessionOutboundMessage[] = [];
   const sessionLogger = {
     child: () => sessionLogger,
@@ -1378,17 +1360,11 @@ test("close_items_request continues after an archive failure", async () => {
     warn: vi.fn(),
     error: vi.fn(),
   };
-  const archivedAt = "2026-04-01T00:00:00.000Z";
-  const goodRecord = {
-    ...makeAgent({
-      id: "agent-good",
-      cwd: REPO_CWD,
-      status: "idle",
-      updatedAt: "2026-03-01T12:00:00.000Z",
-    }),
-    archivedAt: null as string | null,
-  };
-  const killTerminalBestEffort = vi.fn();
+  const killTerminalBestEffort = vi.fn((terminalId: string) => {
+    if (terminalId === "term-bad") {
+      throw new Error("terminal failed");
+    }
+  });
   const session = asTestSession(
     new Session({
       clientId: "test-client",
@@ -1402,25 +1378,15 @@ test("close_items_request continues after an archive failure", async () => {
         listAgents: () => [],
         getAgent: (agentId: string) =>
           agentId === "agent-bad" || agentId === "agent-good" ? { id: agentId } : null,
-        archiveAgent: async (agentId: string) => {
-          if (agentId === "agent-bad") {
-            throw new Error("archive failed");
-          }
-          return { archivedAt };
+        archiveAgent: async () => {
+          throw new Error("archiveAgent should not be called");
         },
         clearAgentAttention: async () => {},
         notifyAgentState: () => {},
       }),
       agentStorage: asAgentStorage({
         list: async () => [],
-        get: async (agentId: string) => {
-          if (agentId !== "agent-good") {
-            return null;
-          }
-          goodRecord.archivedAt = archivedAt;
-          goodRecord.updatedAt = archivedAt;
-          return goodRecord;
-        },
+        get: async () => null,
       }),
       projectRegistry: (() => {
         const proj = createPersistedProjectRecord({
@@ -1505,24 +1471,20 @@ test("close_items_request continues after an archive failure", async () => {
   await session.handleMessage({
     type: "close_items_request",
     agentIds: ["agent-bad", "agent-good"],
-    terminalIds: ["term-1"],
+    terminalIds: ["term-bad", "term-good"],
     requestId: "req-close-best-effort",
   });
 
-  expect(interruptAgentIfRunningBestEffort).toHaveBeenCalledWith("agent-bad");
-  expect(interruptAgentIfRunningBestEffort).toHaveBeenCalledWith("agent-good");
-  expect(killTerminalBestEffort).toHaveBeenCalledWith("term-1");
+  expect(interruptAgentIfRunningBestEffort).not.toHaveBeenCalled();
+  expect(killTerminalBestEffort).toHaveBeenCalledWith("term-bad");
+  expect(killTerminalBestEffort).toHaveBeenCalledWith("term-good");
   expect(emitted.find((message) => message.type === "close_items_response")?.payload).toEqual({
-    agents: [{ agentId: "agent-good", archivedAt }],
-    terminals: [{ terminalId: "term-1", success: true }],
+    agents: [],
+    terminals: [
+      { terminalId: "term-bad", success: false },
+      { terminalId: "term-good", success: true },
+    ],
     requestId: "req-close-best-effort",
-  });
-  expect(emitted.find((message) => message.type === "agent_update")?.payload).toMatchObject({
-    kind: "upsert",
-    agent: {
-      id: "agent-good",
-      archivedAt,
-    },
   });
   expect(sessionLogger.warn).toHaveBeenCalled();
 });
@@ -1803,6 +1765,62 @@ test("legacy unscoped fetch_agents keeps global workspace behavior", async () =>
     "legacy-active",
     "legacy-archived-workspace",
   ]);
+});
+
+test("fetch_agents_request hides records after syncing native archived state", async () => {
+  const session = createSessionForWorkspaceTests();
+  const root = path.resolve("/tmp/native-sync");
+  const project = createPersistedProjectRecord({
+    projectId: "proj-native-sync",
+    rootPath: root,
+    kind: "non_git",
+    displayName: "native sync",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: "ws-native-sync",
+    projectId: project.projectId,
+    cwd: root,
+    kind: "directory",
+    displayName: "native sync",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  let archivedAt: string | null = null;
+  const syncNativeArchivedStateForStoredAgents = vi.fn(async () => {
+    archivedAt = "2026-03-02T12:00:00.000Z";
+  });
+
+  session.agentManager.syncNativeArchivedStateForStoredAgents =
+    syncNativeArchivedStateForStoredAgents;
+  session.projectRegistry.get = async () => project;
+  session.workspaceRegistry.list = async () => [workspace];
+  session.listAgentPayloads = async () => [
+    makeAgent({
+      id: "active-agent",
+      cwd: root,
+      status: "idle",
+      updatedAt: "2026-03-01T12:01:00.000Z",
+    }),
+    {
+      ...makeAgent({
+        id: "native-archived-agent",
+        cwd: root,
+        status: "idle",
+        updatedAt: "2026-03-01T12:00:00.000Z",
+      }),
+      archivedAt,
+    },
+  ];
+
+  const result = await session.listFetchAgentsEntries({
+    type: "fetch_agents_request",
+    requestId: "req-native-sync",
+  });
+
+  expect(syncNativeArchivedStateForStoredAgents).toHaveBeenCalledTimes(1);
+  expect(agentIdsFromEntries(result.entries)).toEqual(["active-agent"]);
 });
 
 test("fetch_agent_history_request pages archived historical rows separately", async () => {

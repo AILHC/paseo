@@ -9,7 +9,12 @@ import { createTestPaseoDaemon } from "./test-utils/paseo-daemon.js";
 import { asInternals, createStub } from "./test-utils/class-mocks.js";
 
 interface SessionInternals {
-  archiveAgentForClose(agentId: string): Promise<{ archivedAt: string }>;
+  handleCloseItemsRequest(msg: {
+    type: "close_items_request";
+    requestId: string;
+    agentIds: string[];
+    terminalIds: string[];
+  }): Promise<unknown>;
   handleUpdateAgentRequest(
     agentId: string,
     title: string,
@@ -139,9 +144,13 @@ describe("snapshot mutation ownership boundary", () => {
       }),
     );
 
-    const archiveResult = await session.archiveAgentForClose("agent-1");
-    expect(archiveSnapshot).toHaveBeenCalledTimes(1);
-    expect(archiveResult.archivedAt).toBeTruthy();
+    await session.handleCloseItemsRequest({
+      type: "close_items_request",
+      requestId: "close-1",
+      agentIds: ["agent-1"],
+      terminalIds: [],
+    });
+    expect(archiveSnapshot).not.toHaveBeenCalled();
 
     await session.handleUpdateAgentRequest(
       "agent-1",

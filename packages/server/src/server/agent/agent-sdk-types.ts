@@ -463,6 +463,7 @@ export interface PersistedAgentDescriptor {
   lastActivityAt: Date;
   persistence: AgentPersistenceHandle;
   timeline: AgentTimelineItem[];
+  archivedAt?: Date | null;
 }
 
 export interface AgentSessionConfig {
@@ -592,4 +593,5 @@ export interface AgentClient {
    * Called when Paseo archives an agent so the provider's own UI reflects the same state.
    */
   archiveNativeSession?(handle: AgentPersistenceHandle): Promise<void>;
+  unarchiveNativeSession?(handle: AgentPersistenceHandle): Promise<void>;
 }

@@ -2568,7 +2568,10 @@ describe("Codex persisted sessions", () => {
     ];
 
     const fakeClient = {
-      request: async (method: string) => {
+      request: async (method: string, params?: unknown) => {
+        if (method === "thread/list" && (params as { archived?: boolean })?.archived === true) {
+          return { data: [] };
+        }
         if (method === "thread/list") return { data: allThreads };
         if (method === "thread/read") return { thread: { turns: [] } };
         return {};
@@ -2597,5 +2600,122 @@ describe("Codex persisted sessions", () => {
 
     expect(descriptors.map((d) => d.sessionId).sort()).toEqual(["thread-a1", "thread-a2"]);
     expect(descriptors.every((d) => d.cwd === "/workspace/project-a")).toBe(true);
+  });
+
+  test("unarchiveNativeSession sends thread/unarchive to Codex app server", async () => {
+    const requests: Array<{ method: string; params: unknown }> = [];
+    const fakeClient = {
+      request: async (method: string, params?: unknown) => {
+        requests.push({ method, params });
+        if (method === "initialize") return {};
+        if (method === "thread/unarchive") return {};
+        throw new Error(`unexpected request ${method}`);
+      },
+      notify: () => {},
+      dispose: async () => {},
+    };
+    const provider = new CodexAppServerAgentClient(createTestLogger(), undefined, {
+      _createCodexClient: () => fakeClient,
+    });
+    castInternals<{ spawnAppServer: () => Promise<ChildProcessWithoutNullStreams> }>(
+      provider,
+    ).spawnAppServer = async () => {
+      const child = new EventEmitter() as ChildProcessWithoutNullStreams;
+      child.exitCode = 0;
+      child.signalCode = null;
+      child.stdin = new PassThrough();
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.kill = vi.fn(() => true) as ChildProcessWithoutNullStreams["kill"];
+      return child;
+    };
+
+    await provider.unarchiveNativeSession({
+      provider: "codex",
+      sessionId: "thread-123",
+      nativeHandle: "thread-123",
+    });
+
+    expect(requests).toContainEqual({
+      method: "thread/unarchive",
+      params: { threadId: "thread-123" },
+    });
+  });
+
+  test("listPersistedAgents includes Codex archived threads even when active threads reach the limit", async () => {
+    const requests: Array<{ method: string; params: unknown }> = [];
+    const fakeClient = {
+      request: async (method: string, params?: unknown) => {
+        requests.push({ method, params });
+        if (method === "initialize") return {};
+        if (method === "thread/list" && (params as { archived?: boolean })?.archived === true) {
+          return {
+            data: [
+              {
+                id: "archived-thread",
+                cwd: "/workspace/project-a",
+                preview: "Archived thread",
+                createdAt: 1,
+                updatedAt: 2,
+                archivedAt: 3,
+              },
+            ],
+          };
+        }
+        if (method === "thread/list") {
+          return {
+            data: [
+              {
+                id: "active-thread",
+                cwd: "/workspace/project-a",
+                preview: "Active thread",
+                createdAt: 4,
+                updatedAt: 5,
+              },
+            ],
+          };
+        }
+        if (method === "thread/read") return { thread: { turns: [] } };
+        throw new Error(`unexpected request ${method}`);
+      },
+      notify: () => {},
+      dispose: async () => {},
+    };
+    const provider = new CodexAppServerAgentClient(createTestLogger(), undefined, {
+      _createCodexClient: () => fakeClient,
+    });
+    castInternals<{ spawnAppServer: () => Promise<ChildProcessWithoutNullStreams> }>(
+      provider,
+    ).spawnAppServer = async () => {
+      const child = new EventEmitter() as ChildProcessWithoutNullStreams;
+      child.exitCode = 0;
+      child.signalCode = null;
+      child.stdin = new PassThrough();
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.kill = vi.fn(() => true) as ChildProcessWithoutNullStreams["kill"];
+      return child;
+    };
+
+    const descriptors = await provider.listPersistedAgents({
+      cwd: "/workspace/project-a",
+      limit: 1,
+    });
+
+    expect(requests).toEqual(
+      expect.arrayContaining([
+        { method: "thread/list", params: expect.objectContaining({ archived: true }) },
+      ]),
+    );
+    expect(descriptors.map((descriptor) => descriptor.sessionId).sort()).toEqual([
+      "active-thread",
+      "archived-thread",
+    ]);
+    expect(
+      descriptors.find((descriptor) => descriptor.sessionId === "archived-thread"),
+    ).toMatchObject({
+      sessionId: "archived-thread",
+      archivedAt: new Date(3000),
+    });
   });
 });
