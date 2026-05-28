@@ -36,7 +36,7 @@ import {
   transformCopilotSessionResponse,
   writeCopilotProviderMode,
 } from "./copilot-acp-agent.js";
-import { transformPiModels } from "./pi-direct-agent.js";
+import { transformPiModels } from "./pi/agent.js";
 import type { AgentStreamEvent } from "../agent-sdk-types.js";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import { asInternals } from "../../test-utils/class-mocks.js";
@@ -360,6 +360,33 @@ describe("createLoggedNdJsonStream", () => {
     await writer.close();
     reader.releaseLock();
     consoleError.mockRestore();
+  });
+
+  test("normalizes stringified numeric ACP response ids", async () => {
+    const input = new TransformStream<Uint8Array, Uint8Array>();
+    const output = new TransformStream<Uint8Array, Uint8Array>();
+    const logger = {
+      warn: vi.fn(),
+    };
+
+    const stream = createLoggedNdJsonStream(output.writable, input.readable, {
+      logger: asInternals<ReturnType<typeof createTestLogger>>(logger),
+      provider: "deepseek-tui",
+    });
+    const reader = stream.readable.getReader();
+    const writer = input.writable.getWriter();
+
+    await writer.write(
+      new TextEncoder().encode('{"jsonrpc":"2.0","id":"0","result":{"ok":true}}\n'),
+    );
+
+    const parsed = await reader.read();
+
+    expect(parsed.value).toEqual({ jsonrpc: "2.0", id: 0, result: { ok: true } });
+    expect(logger.warn).not.toHaveBeenCalled();
+
+    await writer.close();
+    reader.releaseLock();
   });
 
   test("does not log terminal control sequences from malformed ACP stdout", async () => {
@@ -702,6 +729,31 @@ describe("ACPAgentSession Zed parity", () => {
 
     await expect(internals.applyConfiguredOverrides()).resolves.toBeUndefined();
     expect(setSessionConfigOption).not.toHaveBeenCalled();
+  });
+
+  test("does not fail session start when configured model cannot be applied by ACP", async () => {
+    const logger = createTestLogger();
+    const childLogger = { trace: vi.fn(), warn: vi.fn() };
+    vi.spyOn(logger, "child").mockReturnValue(asInternals<typeof logger>(childLogger));
+    const session = createSessionWithConfig(
+      { provider: "deepseek-tui", model: "deepseek/v4" },
+      logger,
+    );
+    const { internals, setSessionConfigOption, unstableSetSessionModel } =
+      prepareConfiguredOverrideSession(session, {
+        currentModel: null,
+        availableModels: null,
+        configOptions: [],
+        connection: { unstable_setSessionModel: undefined },
+      });
+
+    await expect(internals.applyConfiguredOverrides()).resolves.toBeUndefined();
+    expect(unstableSetSessionModel).not.toHaveBeenCalled();
+    expect(setSessionConfigOption).not.toHaveBeenCalled();
+    expect(childLogger.warn).toHaveBeenCalledWith(
+      { value: "deepseek/v4" },
+      "deepseek-tui does not expose ACP model selection; using provider default model",
+    );
   });
 
   test("routes config_option_update and refreshes derived mode, model, and thinking state", async () => {
@@ -1364,7 +1416,27 @@ describe("transformPiModels", () => {
 
 describe("ACPAgentSession slash commands", () => {
   test("returns immediately for ACP sessions that do not wait for async command discovery", async () => {
-    const session = createSession();
+    const session = new ACPAgentSession(
+      {
+        provider: "claude-acp",
+        cwd: "/tmp/paseo-acp-test",
+      },
+      {
+        provider: "claude-acp",
+        logger: createTestLogger(),
+        defaultCommand: ["claude", "--acp"],
+        defaultModes: [],
+        capabilities: {
+          supportsStreaming: true,
+          supportsSessionPersistence: true,
+          supportsDynamicModes: true,
+          supportsMcpServers: true,
+          supportsReasoningStream: true,
+          supportsToolInvocations: true,
+        },
+        waitForInitialCommands: false,
+      },
+    );
 
     await expect(session.listCommands()).resolves.toEqual([]);
   });
@@ -1438,6 +1510,26 @@ describe("ACPAgentSession slash commands", () => {
 });
 
 describe("ACPAgentSession", () => {
+  test("accepts ACP extension notifications without failing the JSON-RPC connection", async () => {
+    const logger = createTestLogger();
+    const trace = vi.spyOn(logger, "trace");
+    const session = createSessionWithConfig({ provider: "kiro" }, logger);
+
+    await expect(
+      session.extNotification("_kiro.dev/session/initialized", {
+        sessionId: "session-1",
+      }),
+    ).resolves.toBeUndefined();
+    expect(trace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: "kiro",
+        method: "_kiro.dev/session/initialized",
+        sessionId: "session-1",
+      }),
+      "provider.acp.extension_notification",
+    );
+  });
+
   test("emits assistant and reasoning chunks as deltas while user chunks stay accumulated", async () => {
     const session = createSession();
     const events: Array<{ type: string; item?: { type: string; text?: string } }> = [];

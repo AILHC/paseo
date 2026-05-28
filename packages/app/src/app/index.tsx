@@ -7,10 +7,11 @@ import {
   resolveStartupWorkspaceSelection,
 } from "@/app/host-runtime-bootstrap";
 import {
-  navigateToWorkspace,
-  useActiveWorkspaceSelection,
+  useIsLastWorkspaceSelectionHydrated,
+  useLastWorkspaceSelection,
 } from "@/stores/navigation-active-workspace-store";
 import { shouldUseDesktopDaemon } from "@/desktop/daemon/desktop-daemon";
+import { buildHostWorkspaceRoute } from "@/utils/host-routes";
 
 const isDesktop = shouldUseDesktopDaemon();
 
@@ -18,34 +19,33 @@ export default function Index() {
   const pathname = usePathname();
   const bootstrapState = useHostRuntimeBootstrapState();
   const anyOnlineHostServerId = useEarliestOnlineHostServerId();
-  const workspaceSelection = useActiveWorkspaceSelection();
+  const workspaceSelection = useLastWorkspaceSelection();
+  const isWorkspaceSelectionLoaded = useIsLastWorkspaceSelectionHydrated();
 
   const redirectRoute = resolveStartupRedirectRoute({
     pathname,
     anyOnlineHostServerId,
     workspaceSelection,
-    isWorkspaceSelectionLoaded: true,
+    isWorkspaceSelectionLoaded,
     hasGivenUpWaitingForHost: bootstrapState.hasGivenUpWaitingForHost,
   });
   const startupWorkspaceSelection = resolveStartupWorkspaceSelection({
     pathname,
     anyOnlineHostServerId,
     workspaceSelection,
-    isWorkspaceSelectionLoaded: true,
+    isWorkspaceSelectionLoaded,
     hasGivenUpWaitingForHost: bootstrapState.hasGivenUpWaitingForHost,
   });
 
-  React.useEffect(() => {
-    if (!startupWorkspaceSelection) {
-      return;
-    }
-    navigateToWorkspace(startupWorkspaceSelection.serverId, startupWorkspaceSelection.workspaceId, {
-      currentPathname: pathname,
-    });
-  }, [pathname, startupWorkspaceSelection]);
-
   if (startupWorkspaceSelection) {
-    return <StartupSplashScreen bootstrapState={isDesktop ? bootstrapState : undefined} />;
+    return (
+      <Redirect
+        href={buildHostWorkspaceRoute(
+          startupWorkspaceSelection.serverId,
+          startupWorkspaceSelection.workspaceId,
+        )}
+      />
+    );
   }
 
   if (redirectRoute) {

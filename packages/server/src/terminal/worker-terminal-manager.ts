@@ -1,8 +1,8 @@
 import { fork } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
-import type { TerminalState } from "../shared/messages.js";
-import { TerminalInputModeTracker } from "../shared/terminal-input-mode.js";
+import type { TerminalState } from "@getpaseo/protocol/messages";
+import { TerminalInputModeTracker } from "@getpaseo/protocol/terminal-input-mode";
 import type {
   ClientMessage,
   ServerMessage,
@@ -200,8 +200,18 @@ export function createWorkerTerminalManager(
         }
         sendBestEffortRequest({ type: "send", terminalId: record.info.id, message });
       },
-      subscribe(listener: (msg: ServerMessage) => void): () => void {
+      subscribe(
+        listener: (msg: ServerMessage) => void,
+        options?: { initialSnapshot?: "state" | "ready" },
+      ): () => void {
         record.messageListeners.add(listener);
+        if (options?.initialSnapshot === "ready") {
+          queueMicrotask(() => {
+            if (record.messageListeners.has(listener)) {
+              listener({ type: "snapshotReady", revision: 0 });
+            }
+          });
+        }
         return () => {
           record.messageListeners.delete(listener);
         };
@@ -244,9 +254,14 @@ export function createWorkerTerminalManager(
       getState(): TerminalState {
         return record.state;
       },
-      getStateSnapshot(): TerminalStateSnapshot {
+      getStateSnapshot(options?: { scrollbackLines?: number }): TerminalStateSnapshot {
+        const scrollbackLines = options?.scrollbackLines;
+        const scrollback =
+          typeof scrollbackLines === "number"
+            ? record.state.scrollback.slice(-scrollbackLines)
+            : record.state.scrollback;
         return {
-          state: record.state,
+          state: { ...record.state, scrollback },
           revision: 0,
         };
       },
@@ -255,6 +270,16 @@ export function createWorkerTerminalManager(
       },
       getTitle(): string | undefined {
         return record.info.title;
+      },
+      setTitle(nextTitle: string): void {
+        const manualTitle = nextTitle.trim();
+        if (!manualTitle) {
+          return;
+        }
+        record.info = { ...record.info, title: manualTitle };
+        for (const listener of Array.from(record.titleChangeListeners)) {
+          listener(manualTitle);
+        }
       },
       getExitInfo(): TerminalExitInfo | null {
         return record.exitInfo;
@@ -529,11 +554,24 @@ export function createWorkerTerminalManager(
       return recordsById.get(id)?.session;
     },
 
-    async getTerminalState(id: string): Promise<TerminalStateSnapshot | null> {
+    async getTerminalState(
+      id: string,
+      options?: { scrollbackLines?: number },
+    ): Promise<TerminalStateSnapshot | null> {
       return (await sendRequest({
         type: "getTerminalState",
         terminalId: id,
+        ...(options ? { options } : {}),
       })) as TerminalWorkerStateResult;
+    },
+
+    setTerminalTitle(id: string, title: string): boolean {
+      const session = recordsById.get(id)?.session;
+      if (!session) {
+        return false;
+      }
+      session.setTitle(title);
+      return true;
     },
 
     killTerminal(id: string): void {

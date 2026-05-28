@@ -11,6 +11,7 @@ import { useAutocomplete } from "./use-autocomplete";
 import { useSessionStore } from "@/stores/session-store";
 import { useHostRuntimeClient, useHostRuntimeIsConnected } from "@/runtime/host-runtime";
 import { CLIENT_SLASH_COMMANDS, type ClientSlashCommand } from "@/client-slash-commands";
+import { filterAndRankCommandAutocompleteEntries } from "@/utils/agent-command-autocomplete";
 import {
   applyFileMentionReplacement,
   findActiveFileMention,
@@ -168,7 +169,7 @@ function resolveAutocompleteIsLoading(args: {
   optionsLength: number;
 }): boolean {
   if (args.mode === "command") {
-    return args.isCommandsLoading;
+    return args.isCommandsLoading && args.optionsLength === 0;
   }
   if (args.mode === "file") {
     return (
@@ -251,7 +252,7 @@ export function useAgentAutocomplete(input: UseAgentAutocompleteInput): AgentAut
   const isConnected = useHostRuntimeIsConnected(serverId);
 
   const mode = resolveAutocompleteMode({ showFileAutocomplete, showCommandAutocomplete });
-  const isVisible = resolveAutocompleteIsVisible({
+  const canShowAutocomplete = resolveAutocompleteIsVisible({
     mode,
     canLoadCommands,
     serverId,
@@ -269,6 +270,8 @@ export function useAgentAutocomplete(input: UseAgentAutocompleteInput): AgentAut
     enabled: mode === "command" && canLoadCommands,
     draftConfig: queryDraftConfig,
   });
+
+  const isVisible = canShowAutocomplete && !(mode === "command" && isCommandsLoading);
 
   const fileSuggestionsQuery = useQuery({
     queryKey: [
@@ -312,7 +315,6 @@ export function useAgentAutocomplete(input: UseAgentAutocompleteInput): AgentAut
     }
 
     if (mode === "command") {
-      const filterLower = commandFilterQuery.toLowerCase();
       const providerCommands = commands.map(
         (command): AvailableCommand => ({ source: "provider", command }),
       );
@@ -324,8 +326,9 @@ export function useAgentAutocomplete(input: UseAgentAutocompleteInput): AgentAut
             ),
             ...providerCommands,
           ];
-      const matches = availableCommands.filter((entry) =>
-        entry.command.name.toLowerCase().includes(filterLower),
+      const matches = filterAndRankCommandAutocompleteEntries(
+        availableCommands,
+        commandFilterQuery,
       );
       const orderedMatches = orderAutocompleteOptions(matches);
       return orderedMatches.map(mapCommandToOption);

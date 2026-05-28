@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import { createNoopWorkspaceGitService } from "../test-utils/workspace-git-service-stub.js";
-import { MAX_AUTO_AGENT_TITLE_CHARS } from "./agent-title-limits.js";
+import { MAX_AUTO_AGENT_TITLE_CHARS } from "@getpaseo/protocol/agent-title-limits";
 import {
   generateAndApplyAgentMetadata,
   type AgentMetadataGeneratorDeps,
@@ -39,8 +39,8 @@ function createDeps(
 
 describe("agent metadata generator auto-title", () => {
   it("caps generated auto titles at 40 characters before persisting", async () => {
-    const setTitle = vi.fn().mockResolvedValue(undefined);
-    const manager = { setTitle } as unknown as AgentManager;
+    const setGeneratedTitle = vi.fn().mockResolvedValue(undefined);
+    const manager = { setGeneratedTitle } as unknown as AgentManager;
     const generatedTitle = "x".repeat(MAX_AUTO_AGENT_TITLE_CHARS + 25);
     const generateStructured = vi.fn().mockResolvedValue({ title: generatedTitle }) as NonNullable<
       AgentMetadataGeneratorDeps["generateStructuredAgentResponseWithFallback"]
@@ -56,13 +56,16 @@ describe("agent metadata generator auto-title", () => {
       deps: createDeps(generateStructured),
     });
 
-    expect(setTitle).toHaveBeenCalledTimes(1);
-    expect(setTitle).toHaveBeenCalledWith("agent-1", "x".repeat(MAX_AUTO_AGENT_TITLE_CHARS));
+    expect(setGeneratedTitle).toHaveBeenCalledTimes(1);
+    expect(setGeneratedTitle).toHaveBeenCalledWith(
+      "agent-1",
+      "x".repeat(MAX_AUTO_AGENT_TITLE_CHARS),
+    );
   });
 
   it("does not generate an auto title when an explicit title is provided", async () => {
-    const setTitle = vi.fn().mockResolvedValue(undefined);
-    const manager = { setTitle } as unknown as AgentManager;
+    const setGeneratedTitle = vi.fn().mockResolvedValue(undefined);
+    const manager = { setGeneratedTitle } as unknown as AgentManager;
     const generateStructured = vi.fn().mockResolvedValue({ title: "Generated" }) as NonNullable<
       AgentMetadataGeneratorDeps["generateStructuredAgentResponseWithFallback"]
     >;
@@ -78,12 +81,12 @@ describe("agent metadata generator auto-title", () => {
     });
 
     expect(generateStructured).not.toHaveBeenCalled();
-    expect(setTitle).not.toHaveBeenCalled();
+    expect(setGeneratedTitle).not.toHaveBeenCalled();
   });
 
   it("generates titles independently from workspace branch naming", async () => {
-    const setTitle = vi.fn().mockResolvedValue(undefined);
-    const manager = { setTitle } as unknown as AgentManager;
+    const setGeneratedTitle = vi.fn().mockResolvedValue(undefined);
+    const manager = { setGeneratedTitle } as unknown as AgentManager;
     const generateStructured = vi
       .fn()
       .mockResolvedValue({ title: "Generated title" }) as NonNullable<
@@ -108,7 +111,7 @@ describe("agent metadata generator auto-title", () => {
         persistSession: false,
       }),
     );
-    expect(setTitle).toHaveBeenCalledWith("agent-suppressed-branch", "Generated title");
+    expect(setGeneratedTitle).toHaveBeenCalledWith("agent-suppressed-branch", "Generated title");
   });
 
   it.each([
@@ -170,8 +173,8 @@ async function generateTitlePromptWithConfig(config: unknown): Promise<{ prompt:
     writeFileSync(path.join(repoRoot, "paseo.json"), `${JSON.stringify(config)}\n`);
   }
 
-  const setTitle = vi.fn().mockResolvedValue(undefined);
-  const manager = { setTitle } as unknown as AgentManager;
+  const setGeneratedTitle = vi.fn().mockResolvedValue(undefined);
+  const manager = { setGeneratedTitle } as unknown as AgentManager;
   const generateStructured = vi.fn().mockResolvedValue({ title: "Generated title" }) as NonNullable<
     AgentMetadataGeneratorDeps["generateStructuredAgentResponseWithFallback"]
   >;

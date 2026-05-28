@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { execFileSync } from "child_process";
+import { execFileSync, execSync } from "child_process";
 import {
   existsSync,
   mkdtempSync,
@@ -17,6 +17,7 @@ import {
   __setPullRequestStatusCacheTtlForTests,
   commitAll,
   getCachedCheckoutShortstat,
+  getCheckoutSnapshotFacts,
   getCurrentBranch,
   getCheckoutDiff,
   getCheckoutShortstat,
@@ -34,10 +35,12 @@ import {
   resolveBranchCheckout,
   resolveRepositoryDefaultBranch,
   parseWorktreeList,
+  renameCurrentBranch,
   isPaseoWorktreePath,
   isDescendantPath,
   warmCheckoutShortstatInBackground,
 } from "./checkout-git.js";
+import { startGitCommandMetrics, stopGitCommandMetrics } from "./run-git-command.js";
 import {
   GitHubCommandError,
   GitHubCliMissingError,
@@ -263,6 +266,48 @@ describe("checkout git utilities", () => {
     expect(branch).toBe("feature/rebase-test");
   });
 
+  it("renames the checked out branch and returns concrete branch names", async () => {
+    execSync("git checkout -b feature/old-name", { cwd: repoDir });
+
+    const result = await renameCurrentBranch(repoDir, "feature/new-name");
+
+    const currentBranch = execSync("git branch --show-current", { cwd: repoDir }).toString().trim();
+    expect(currentBranch).toBe("feature/new-name");
+    expect(result).toEqual({
+      previousBranch: "feature/old-name",
+      currentBranch: "feature/new-name",
+    });
+    expect(() =>
+      execSync("git show-ref --verify refs/heads/feature/old-name", { cwd: repoDir }),
+    ).toThrow();
+    expect(
+      execSync("git show-ref --verify refs/heads/feature/new-name", { cwd: repoDir })
+        .toString()
+        .trim(),
+    ).toContain("refs/heads/feature/new-name");
+  });
+
+  it("fails when renaming the checked out branch to an existing branch", async () => {
+    execSync("git branch feature/new-name", { cwd: repoDir });
+    execSync("git checkout -b feature/old-name", { cwd: repoDir });
+
+    await expect(renameCurrentBranch(repoDir, "feature/new-name")).rejects.toThrow();
+
+    expect(execSync("git branch --show-current", { cwd: repoDir }).toString().trim()).toBe(
+      "feature/old-name",
+    );
+    expect(
+      execSync("git show-ref --verify refs/heads/feature/old-name", { cwd: repoDir })
+        .toString()
+        .trim(),
+    ).toContain("refs/heads/feature/old-name");
+    expect(
+      execSync("git show-ref --verify refs/heads/feature/new-name", { cwd: repoDir })
+        .toString()
+        .trim(),
+    ).toContain("refs/heads/feature/new-name");
+  });
+
   it("handles status/diff/commit in a normal repo", async () => {
     writeFileSync(join(repoDir, "file.txt"), "updated\n");
 
@@ -284,6 +329,48 @@ describe("checkout git utilities", () => {
       .toString()
       .trim();
     expect(message).toBe("update file");
+  });
+
+  it("reuses checkout snapshot facts across status, shortstat, and PR status reads", async () => {
+    setupRemoteTrackingMain(repoDir, tempDir);
+    execFileSync("git", ["checkout", "-b", "feature/facts"], { cwd: repoDir });
+    commitFile(repoDir, "feature.txt", "feature\n", "feature");
+    writeFileSync(join(repoDir, "feature.txt"), "feature\nchanged\n");
+    const github = createGitHubServiceForStatus(createPullRequestStatus());
+
+    const facts = await getCheckoutSnapshotFacts(repoDir, { paseoHome });
+    const status = await getCheckoutStatus(repoDir, { paseoHome, facts });
+    const shortstat = await getCheckoutShortstat(repoDir, { paseoHome, facts }, { force: true });
+    const prStatus = await getPullRequestStatus(
+      repoDir,
+      github,
+      { force: true, reason: "snapshot-equivalence" },
+      { paseoHome, facts },
+    );
+
+    __resetCheckoutShortstatCacheForTests();
+    __resetPullRequestStatusCacheForTests();
+    startGitCommandMetrics();
+    const statusWithFacts = await getCheckoutStatus(repoDir, { paseoHome, facts });
+    const shortstatWithFacts = await getCheckoutShortstat(
+      repoDir,
+      { paseoHome, facts },
+      { force: true },
+    );
+    const prStatusWithFacts = await getPullRequestStatus(
+      repoDir,
+      github,
+      { force: true, reason: "snapshot-equivalence-with-facts" },
+      { paseoHome, facts },
+    );
+    const metrics = stopGitCommandMetrics();
+    const commands = metrics.commands.map((command) => command.args.join(" "));
+
+    expect(statusWithFacts).toEqual(status);
+    expect(shortstatWithFacts).toEqual(shortstat);
+    expect(prStatusWithFacts).toEqual(prStatus);
+    expect(commands).not.toContain("rev-parse --show-toplevel");
+    expect(commands).not.toContain("rev-parse --abbrev-ref HEAD");
   });
 
   it("hides whitespace-only changes when requested", async () => {
@@ -448,6 +535,53 @@ const x = 1;
       return;
     }
     expect(status.aheadOfOrigin).toBeNull();
+  });
+
+  it("does not report full history as unpushed for fresh no-track Paseo worktrees", async () => {
+    setupRemoteTrackingMain(repoDir, tempDir);
+    commitFile(repoDir, "second.txt", "second\n", "second commit");
+    execFileSync("git", ["push"], { cwd: repoDir });
+
+    const worktree = await createLegacyWorktreeForTest({
+      branchName: "fresh-feature",
+      cwd: repoDir,
+      baseBranch: "main",
+      worktreeSlug: "fresh-feature",
+      paseoHome,
+    });
+
+    const status = await getCheckoutStatus(worktree.worktreePath, { paseoHome });
+    expect(status).toMatchObject({
+      isGit: true,
+      isPaseoOwnedWorktree: true,
+      baseRef: "main",
+      aheadBehind: { ahead: 0, behind: 0 },
+      aheadOfOrigin: 0,
+    });
+  });
+
+  it("reports local-only worktree commits as unpushed relative to base", async () => {
+    setupRemoteTrackingMain(repoDir, tempDir);
+    commitFile(repoDir, "second.txt", "second\n", "second commit");
+    execFileSync("git", ["push"], { cwd: repoDir });
+
+    const worktree = await createLegacyWorktreeForTest({
+      branchName: "fresh-feature",
+      cwd: repoDir,
+      baseBranch: "main",
+      worktreeSlug: "fresh-feature",
+      paseoHome,
+    });
+    commitFile(worktree.worktreePath, "feature.txt", "feature\n", "feature commit");
+
+    const status = await getCheckoutStatus(worktree.worktreePath, { paseoHome });
+    expect(status).toMatchObject({
+      isGit: true,
+      isPaseoOwnedWorktree: true,
+      baseRef: "main",
+      aheadBehind: { ahead: 1, behind: 0 },
+      aheadOfOrigin: 1,
+    });
   });
 
   it("does not report incoming additions when the base branch is behind its remote", async () => {

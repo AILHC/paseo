@@ -1,5 +1,5 @@
 ---
-title: Happy Coder alternative with a desktop app and git worktrees
+title: Happy Coder Alternative With a Desktop App and Git Worktrees
 description: Paseo ships a native desktop app, runs agents in isolated git worktrees, and supports 30+ agents. Happy Coder is mobile and web only, wraps the agent CLI, and supports Claude Code and Codex.
 nav: Happy Coder
 order: 104
@@ -10,6 +10,8 @@ order: 104
 Happy Coder is a mobile and web client for Claude Code and Codex. It wraps the agent CLI on your laptop and syncs sessions to phone and browser over an end-to-end encrypted relay. Open source under MIT.
 
 Paseo is an app for orchestrating coding agents, with native clients on desktop, mobile, web, and the CLI. Open source (AGPL-3.0).
+
+![Paseo desktop and mobile app](/hero-mockup.png)
 
 ## When to pick what
 

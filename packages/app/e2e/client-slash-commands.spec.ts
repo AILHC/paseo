@@ -126,7 +126,7 @@ async function expectReplacementDraftMatchesPreviousSetup(page: Page): Promise<v
   await expect(
     page.getByRole("button", { name: "Select model (Ten second stream)" }),
   ).toBeVisible();
-  await expect(page.getByRole("button", { name: "Select agent mode (load-test)" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Select agent mode (Load test)" })).toBeVisible();
 }
 
 async function createAgentFromReplacementDraft(page: Page): Promise<void> {
@@ -181,7 +181,7 @@ test.describe("Client slash commands", () => {
       page,
       { title: "Slash quit autocomplete e2e" },
       async ({ agent, title }) => {
-        await selectClientSlashCommand(page, "/qu", "/quit");
+        await selectClientSlashCommand(page, "/qu", "/exit");
         await expectWorkspaceTabHidden(page, agent.id);
         await expectAgentArchivedInSessions(page, title);
       },

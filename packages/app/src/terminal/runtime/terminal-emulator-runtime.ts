@@ -7,14 +7,15 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { LigaturesAddon } from "@xterm/addon-ligatures/lib/addon-ligatures.mjs";
 import { Terminal, type ITheme } from "@xterm/xterm";
-import type { TerminalState } from "@server/shared/messages";
+import type { TerminalState } from "@getpaseo/protocol/messages";
 import {
   type TerminalInputModeState,
   TerminalInputModeTracker,
   terminalInputModeStatesEqual,
-} from "@server/shared/terminal-input-mode";
+} from "@getpaseo/protocol/terminal-input-mode";
 import {
   type PendingTerminalModifiers,
+  isAppleHandheldPlatform,
   isTerminalModifierDomKey,
   mergeTerminalModifiers,
   normalizeDomTerminalKey,
@@ -22,6 +23,13 @@ import {
   shouldInterceptDomTerminalKey,
 } from "@/utils/terminal-keys";
 import { renderTerminalSnapshotToAnsi } from "./terminal-snapshot";
+import {
+  createTerminalLocalFileLinkProvider,
+  type TerminalLocalFileLinkSource,
+  type TerminalLocalFileLinkTarget,
+} from "../local-links/terminal-local-link-provider";
+
+export type TerminalOutputData = Uint8Array;
 
 export interface TerminalEmulatorRuntimeMountInput {
   root: HTMLDivElement;
@@ -43,6 +51,13 @@ export interface TerminalEmulatorRuntimeCallbacks {
   }) => Promise<void> | void;
   onPendingModifiersConsumed?: () => Promise<void> | void;
   onOpenExternalUrl?: (url: string) => Promise<void> | void;
+  onResolveLocalFileLink?: (
+    source: TerminalLocalFileLinkSource,
+  ) => Promise<TerminalLocalFileLinkTarget | null> | TerminalLocalFileLinkTarget | null;
+  onOpenLocalFileLink?: (
+    target: TerminalLocalFileLinkTarget,
+    disposition: "main" | "side",
+  ) => Promise<void> | void;
   onInputModeChange?: (state: TerminalInputModeState) => Promise<void> | void;
 }
 
@@ -66,7 +81,7 @@ interface TerminalEmulatorRuntimeDisposables {
 
 interface TerminalOutputOperation {
   type: "write" | "clear" | "snapshot";
-  text: string;
+  data: TerminalOutputData;
   rows?: number;
   cols?: number;
   suppressInput?: boolean;
@@ -84,10 +99,34 @@ const isMac =
   (/Macintosh|Mac OS/i.test(navigator.userAgent ?? "") ||
     /Mac/i.test((navigator as Navigator & { platform?: string }).platform ?? ""));
 
+const isAppleHandheld =
+  typeof navigator !== "undefined" &&
+  isAppleHandheldPlatform({
+    userAgent: navigator.userAgent,
+    platform: (navigator as Navigator & { platform?: string }).platform,
+    maxTouchPoints: navigator.maxTouchPoints,
+  });
+
 const DEFAULT_TOUCH_SCROLL_LINE_HEIGHT_PX = 18;
 const FIT_TIMEOUT_DELAYS_MS = [0, 16, 48, 120, 250, 500, 1_000, 2_000];
 const OUTPUT_OPERATION_TIMEOUT_MS = 5_000;
-const RESET_TERMINAL_ANSI = "\u001bc";
+const EMPTY_TERMINAL_OUTPUT = new Uint8Array(0);
+const RESET_TERMINAL_OUTPUT = new Uint8Array([0x1b, 0x63]);
+const terminalOutputEncoder = new TextEncoder();
+
+export function encodeTerminalOutput(text: string): TerminalOutputData {
+  return terminalOutputEncoder.encode(text);
+}
+
+function prependTerminalOutput(
+  prefix: TerminalOutputData,
+  data: TerminalOutputData,
+): TerminalOutputData {
+  const output = new Uint8Array(prefix.length + data.length);
+  output.set(prefix, 0);
+  output.set(data, prefix.length);
+  return output;
+}
 
 const DEFAULT_TERMINAL_FONT_FAMILY = [
   // Prefer common developer fonts, with Nerd Font variants for prompt/TUI glyphs.
@@ -131,9 +170,11 @@ export class TerminalEmulatorRuntime {
   private outputOperations: TerminalOutputOperation[] = [];
   private inFlightOutputOperation: TerminalOutputOperation | null = null;
   private inFlightOutputOperationTimeout: ReturnType<typeof setTimeout> | null = null;
+  private readonly inputModeDecoder = new TextDecoder();
   private suppressInput = false;
   private readonly inputModeTracker = new TerminalInputModeTracker();
   private lastInputModeState: TerminalInputModeState = this.inputModeTracker.getState();
+  private themeBackgroundElements: HTMLElement[] = [];
 
   private handleVisibilityRestore = (): void => {
     if (typeof document !== "undefined" && document.visibilityState !== "visible") {
@@ -169,14 +210,13 @@ export class TerminalEmulatorRuntime {
       convertEol: false,
       cursorBlink: true,
       cursorStyle: "bar",
-      customGlyphs: true,
       fontFamily: DEFAULT_TERMINAL_FONT_FAMILY,
       fontSize: 13,
       lineHeight: 1.0,
       macOptionIsMeta: true,
       minimumContrastRatio: 1,
       rescaleOverlappingGlyphs: true,
-      overviewRuler: {
+      scrollbar: {
         width: 8,
       },
       scrollback: input.scrollback,
@@ -194,6 +234,17 @@ export class TerminalEmulatorRuntime {
         void this.callbacks.onOpenExternalUrl?.(uri);
       }),
     );
+    const localFileLinkProvider = terminal.registerLinkProvider(
+      createTerminalLocalFileLinkProvider(terminal, {
+        resolveLink: async (source) => {
+          const target = await this.callbacks.onResolveLocalFileLink?.(source);
+          return target ?? null;
+        },
+        openLink: (target, disposition) => {
+          void this.callbacks.onOpenLocalFileLink?.(target, disposition);
+        },
+      }),
+    );
     terminal.loadAddon(new SearchAddon({ highlightLimit: 20_000 }));
     terminal.loadAddon(new ClipboardAddon());
     try {
@@ -202,6 +253,8 @@ export class TerminalEmulatorRuntime {
       // Ligatures require Font Access API or compatible environment
     }
     terminal.open(input.host);
+    this.themeBackgroundElements = this.collectThemeBackgroundElements(input);
+    this.applyThemeBackground(input.theme);
     try {
       terminal.unicode.activeVersion = "11";
     } catch {
@@ -248,6 +301,9 @@ export class TerminalEmulatorRuntime {
         { prefix: "?", intermediates: "$", final: "p" },
         () => true,
       );
+      for (const code of [10, 11, 12]) {
+        terminal.parser.registerOscHandler(code, (data) => data.trim() === "?");
+      }
     };
     registerProtocolQuerySuppression();
 
@@ -365,6 +421,7 @@ export class TerminalEmulatorRuntime {
           metaKey: event.metaKey,
           pendingModifiers: this.pendingModifiers,
           enhancedInputActive: this.inputModeTracker.supportsModifiedEnter(),
+          isAppleHandheld,
         })
       ) {
         return true;
@@ -496,6 +553,7 @@ export class TerminalEmulatorRuntime {
         disposeImageAddon();
       },
       disposeTerminal: () => {
+        localFileLinkProvider.dispose();
         terminal.dispose();
       },
     };
@@ -519,14 +577,18 @@ export class TerminalEmulatorRuntime {
     };
   }
 
-  write(input: { text: string; suppressInput?: boolean; onCommitted?: () => void }): void {
-    if (input.text.length === 0) {
+  write(input: {
+    data: TerminalOutputData;
+    suppressInput?: boolean;
+    onCommitted?: () => void;
+  }): void {
+    if (input.data.length === 0) {
       input.onCommitted?.();
       return;
     }
     this.outputOperations.push({
       type: "write",
-      text: input.text,
+      data: input.data,
       suppressInput: input.suppressInput ?? false,
       ...(input.onCommitted ? { onCommitted: input.onCommitted } : {}),
     });
@@ -536,7 +598,7 @@ export class TerminalEmulatorRuntime {
   clear(input?: { onCommitted?: () => void }): void {
     this.outputOperations.push({
       type: "clear",
-      text: "",
+      data: EMPTY_TERMINAL_OUTPUT,
       suppressInput: false,
       ...(input?.onCommitted ? { onCommitted: input.onCommitted } : {}),
     });
@@ -548,11 +610,25 @@ export class TerminalEmulatorRuntime {
       this.clear(input);
       return;
     }
-    this.outputOperations.push({
-      type: "snapshot",
-      text: `${RESET_TERMINAL_ANSI}${renderTerminalSnapshotToAnsi(input.state)}`,
+    this.restoreOutput({
+      data: encodeTerminalOutput(renderTerminalSnapshotToAnsi(input.state)),
       rows: input.state.rows,
       cols: input.state.cols,
+      ...(input.onCommitted ? { onCommitted: input.onCommitted } : {}),
+    });
+  }
+
+  restoreOutput(input: {
+    data: TerminalOutputData;
+    rows?: number;
+    cols?: number;
+    onCommitted?: () => void;
+  }): void {
+    this.outputOperations.push({
+      type: "snapshot",
+      data: prependTerminalOutput(RESET_TERMINAL_OUTPUT, input.data),
+      rows: input.rows,
+      cols: input.cols,
       suppressInput: true,
       ...(input.onCommitted ? { onCommitted: input.onCommitted } : {}),
     });
@@ -576,6 +652,7 @@ export class TerminalEmulatorRuntime {
       return;
     }
 
+    this.applyThemeBackground(input.theme);
     this.refreshVisibleRows();
   }
 
@@ -595,8 +672,19 @@ export class TerminalEmulatorRuntime {
     this.refreshVisibleRows();
   }
 
-  focus(): void {
-    this.terminal?.focus();
+  focus(input?: { forceRefocus?: boolean }): void {
+    const terminal = this.terminal;
+    if (!terminal) {
+      return;
+    }
+    if (input?.forceRefocus) {
+      terminal.blur();
+    }
+    terminal.focus();
+  }
+
+  blur(): void {
+    this.terminal?.blur();
   }
 
   private refreshVisibleRows(): void {
@@ -609,6 +697,26 @@ export class TerminalEmulatorRuntime {
       terminal.refresh(0, terminal.rows - 1);
     } catch {
       // ignore
+    }
+  }
+
+  private collectThemeBackgroundElements(input: {
+    root: HTMLDivElement;
+    host: HTMLDivElement;
+  }): HTMLElement[] {
+    return [
+      input.root,
+      input.host,
+      ...Array.from(
+        input.host.querySelectorAll<HTMLElement>(".xterm, .xterm-screen, .xterm-viewport"),
+      ),
+    ];
+  }
+
+  private applyThemeBackground(theme: ITheme): void {
+    const background = theme.background ?? "#0b0b0b";
+    for (const element of this.themeBackgroundElements) {
+      element.style.backgroundColor = background;
     }
   }
 
@@ -633,7 +741,9 @@ export class TerminalEmulatorRuntime {
     this.fitAddon = null;
     this.fitAndEmitResize = null;
     this.lastSize = null;
+    this.themeBackgroundElements = [];
     this.suppressInput = false;
+    this.inputModeDecoder.decode();
     this.inputModeTracker.reset();
     this.emitInputModeChange();
   }
@@ -655,7 +765,7 @@ export class TerminalEmulatorRuntime {
 
     this.inFlightOutputOperation = operation;
     const previousSuppressInput = this.suppressInput;
-    if (operation.type === "write") {
+    if (operation.suppressInput) {
       this.suppressInput = Boolean(operation.suppressInput);
     }
     const finalizeOperation = (expectedOperation: TerminalOutputOperation) => {
@@ -670,6 +780,7 @@ export class TerminalEmulatorRuntime {
     };
 
     if (operation.type === "clear") {
+      this.inputModeDecoder.decode();
       this.inputModeTracker.reset();
       this.emitInputModeChange();
       terminal.reset();
@@ -678,6 +789,7 @@ export class TerminalEmulatorRuntime {
     }
 
     if (operation.type === "snapshot") {
+      this.inputModeDecoder.decode();
       this.inputModeTracker.reset();
       this.emitInputModeChange();
       try {
@@ -694,8 +806,9 @@ export class TerminalEmulatorRuntime {
       }
     }
 
-    const text = operation.text;
+    const data = operation.data;
     if (operation.type === "write") {
+      const text = this.inputModeDecoder.decode(data, { stream: true });
       const result = this.inputModeTracker.feed(text);
       if (result.changed) {
         this.emitInputModeChange();
@@ -706,7 +819,7 @@ export class TerminalEmulatorRuntime {
     }, OUTPUT_OPERATION_TIMEOUT_MS);
 
     try {
-      terminal.write(text, () => {
+      terminal.write(data, () => {
         finalizeOperation(operation);
       });
     } catch {

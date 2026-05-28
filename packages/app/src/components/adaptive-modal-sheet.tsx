@@ -3,7 +3,7 @@ import type { ReactNode, Ref } from "react";
 import { createPortal } from "react-dom";
 import { Modal, Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import type { TextInputProps } from "react-native";
-import { StyleSheet, useUnistyles } from "react-native-unistyles";
+import { StyleSheet, useUnistyles, withUnistyles } from "react-native-unistyles";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import { getOverlayRoot, OVERLAY_Z } from "../lib/overlay-root";
 import {
@@ -14,7 +14,7 @@ import {
 } from "@gorhom/bottom-sheet";
 import { ArrowLeft, Search, X } from "lucide-react-native";
 import { FileDropZone } from "@/components/file-drop-zone";
-import type { ImageAttachment } from "@/components/message-input";
+import type { ImageAttachment } from "@/composer/types";
 import {
   IsolatedBottomSheetModal,
   useIsolatedBottomSheetVisibility,
@@ -28,9 +28,7 @@ import { isNative, isWeb } from "@/constants/platform";
 export const SHEET_HORIZONTAL_PADDING_SCALE = 6;
 
 export interface SheetHeaderSearch {
-  value: string;
   onChange: (value: string) => void;
-  initialValue?: string;
   resetKey?: string | number;
   placeholder?: string;
   autoFocus?: boolean;
@@ -167,6 +165,7 @@ const styles = StyleSheet.create((theme) => ({
     borderBottomColor: theme.colors.border,
   },
   inlineTitle: {
+    flex: 1,
     fontSize: theme.fontSize.sm,
     fontWeight: theme.fontWeight.medium,
     color: theme.colors.foreground,
@@ -202,6 +201,25 @@ const styles = StyleSheet.create((theme) => ({
     padding: theme.spacing[SHEET_HORIZONTAL_PADDING_SCALE],
     gap: theme.spacing[4],
   },
+  footer: {
+    paddingHorizontal: theme.spacing[SHEET_HORIZONTAL_PADDING_SCALE],
+    paddingVertical: theme.spacing[3],
+    borderTopWidth: 1,
+    borderTopColor: theme.colors.surface2,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: theme.spacing[2],
+  },
+  adaptiveInputOutline: {
+    outlineColor: theme.colors.accent,
+  },
+  adaptiveInputText: {
+    color: theme.colors.foreground,
+  },
+  adaptiveInputPlaceholder: {
+    color: theme.colors.foregroundMuted,
+  },
 }));
 
 const SEARCH_INPUT_STYLE = [styles.searchInput, isWeb && { outlineStyle: "none" }];
@@ -231,25 +249,43 @@ export type AdaptiveTextInputProps = TextInputProps & {
 // and visibly flicker/cursor-jump. Keep the rendered text native-owned; callers
 // can seed it once with initialValue and remount with resetKey for real resets.
 // See https://github.com/facebook/react-native/issues/44157
+//
+// Text color and placeholder color are owned by this leaf — not the caller.
+// `@gorhom/bottom-sheet` mounts header subtrees before the sheet is visible
+// under whatever theme is active at mount time, then keeps them mounted across
+// theme changes; any caller that paints color via `StyleSheet.create((theme) =>
+// ...)` from outside this leaf ends up with stale colors in dark mode (see
+// docs/unistyles.md "Hidden Sheet Content"). withUnistyles wraps the actual
+// TextInput so theme-driven re-renders land on the wrapper.
+const ThemedTextInput = withUnistyles(TextInput, (theme) => ({
+  placeholderTextColor: theme.colors.foregroundMuted,
+}));
+const ThemedBottomSheetTextInput = withUnistyles(BottomSheetTextInput, (theme) => ({
+  placeholderTextColor: theme.colors.foregroundMuted,
+}));
+
 export const AdaptiveTextInput = forwardRef<TextInput, AdaptiveTextInputProps>(
   function AdaptiveTextInputInner(props, ref) {
     const isMobile = useIsCompactFormFactor();
-    const { value: _value, initialValue, resetKey, defaultValue, ...inputProps } = props;
+    const { value: _value, initialValue, resetKey, defaultValue, style, ...inputProps } = props;
+    // Leaf-owned color goes LAST so callers cannot override it with a stale
+    // theme read. Outline color is theme-aware on web :focus-visible.
     const textInputProps = {
       ...inputProps,
       defaultValue: initialValue ?? defaultValue,
+      style: [styles.adaptiveInputOutline, style, styles.adaptiveInputText],
     };
 
     if (isMobile && isNative) {
       return (
-        <BottomSheetTextInput
+        <ThemedBottomSheetTextInput
           key={resetKey}
           ref={ref as unknown as Ref<never>}
           {...textInputProps}
         />
       );
     }
-    return <TextInput key={resetKey} ref={ref} {...textInputProps} />;
+    return <ThemedTextInput key={resetKey} ref={ref} {...textInputProps} />;
   },
 );
 
@@ -325,10 +361,7 @@ export function SheetHeaderView({
             // @ts-expect-error - outlineStyle is web-only
             style={SEARCH_INPUT_STYLE}
             placeholder={search.placeholder ?? "Search"}
-            placeholderTextColor={theme.colors.foregroundMuted}
-            initialValue={search.initialValue}
             resetKey={search.resetKey}
-            value={search.value}
             onChangeText={handleSearchChange}
             autoCapitalize="none"
             autoCorrect={false}
@@ -345,7 +378,7 @@ export function InlineHeaderView({ header }: { header: SheetHeader }) {
   const { theme } = useUnistyles();
   const back = header.back;
   const handleBackPress = back?.onPress;
-  const hasInlineRow = Boolean(handleBackPress || header.leading);
+  const hasInlineRow = Boolean(handleBackPress || header.leading || header.actions);
   if (!hasInlineRow && !header.search) return null;
   return (
     <View>
@@ -372,6 +405,7 @@ export function InlineHeaderView({ header }: { header: SheetHeader }) {
           <Text style={styles.inlineTitle} numberOfLines={1}>
             {header.title}
           </Text>
+          {header.actions ? <View style={styles.headerActions}>{header.actions}</View> : null}
         </View>
       ) : null}
       {header.search ? (
@@ -381,10 +415,7 @@ export function InlineHeaderView({ header }: { header: SheetHeader }) {
             // @ts-expect-error - outlineStyle is web-only
             style={SEARCH_INPUT_STYLE}
             placeholder={header.search.placeholder ?? "Search"}
-            placeholderTextColor={theme.colors.foregroundMuted}
-            initialValue={header.search.initialValue}
             resetKey={header.search.resetKey}
-            value={header.search.value}
             onChangeText={header.search.onChange}
             autoCapitalize="none"
             autoCorrect={false}
@@ -402,6 +433,8 @@ export interface AdaptiveModalSheetProps {
   visible: boolean;
   onClose: () => void;
   children: ReactNode;
+  /** Sticky footer rendered below the scrollable content. */
+  footer?: ReactNode;
   snapPoints?: string[];
   testID?: string;
   /** Override the max width of the desktop card. */
@@ -416,6 +449,7 @@ export function AdaptiveModalSheet({
   visible,
   onClose,
   children,
+  footer,
   snapPoints,
   testID,
   desktopMaxWidth,
@@ -481,6 +515,7 @@ export function AdaptiveModalSheet({
         ) : (
           <View style={styles.bottomSheetStaticContent}>{children}</View>
         )}
+        {footer ? <View style={styles.footer}>{footer}</View> : null}
       </IsolatedBottomSheetModal>
     );
   }
@@ -493,13 +528,13 @@ export function AdaptiveModalSheet({
           style={styles.desktopScroll}
           contentContainerStyle={styles.desktopContent}
           keyboardShouldPersistTaps="handled"
-          showsVerticalScrollIndicator={false}
         >
           {children}
         </ScrollView>
       ) : (
         <View style={styles.desktopStaticContent}>{children}</View>
       )}
+      {footer ? <View style={styles.footer}>{footer}</View> : null}
     </>
   );
 

@@ -2,7 +2,7 @@
 
 Paseo is a mobile app for monitoring and controlling your local AI coding agents from anywhere. Your dev environment, in your pocket. Connects directly to your actual development environment — your code stays on your machine.
 
-**Supported agents:** Claude Code, Codex, and OpenCode.
+**Supported agents:** Claude Code, Codex, GitHub Copilot, OpenCode, and Pi.
 
 ## Repository map
 
@@ -32,6 +32,7 @@ At the start of non-trivial work, list `docs/` and skim anything relevant to the
 | [docs/design.md](docs/design.md)                               | Theme tokens — colors, fonts, spacing, radii, icons                                                                            |
 | [docs/hover.md](docs/hover.md)                                 | Hover — the canonical pattern (plain View + onPointerEnter/Leave, separate inner Pressable) and the three ways agents break it |
 | [docs/unistyles.md](docs/unistyles.md)                         | Unistyles gotchas — `useUnistyles()` is forbidden, alternatives in order                                                       |
+| [docs/floating-panels.md](docs/floating-panels.md)             | Anchored popovers — Portal/Modal escape for Android, lifecycle gates, keyboard-shared-value, status-bar offset, the flash      |
 | [docs/file-icons.md](docs/file-icons.md)                       | Material icon theme integration for the file explorer                                                                          |
 | [docs/providers.md](docs/providers.md)                         | Adding a new agent provider end-to-end                                                                                         |
 | [docs/custom-providers.md](docs/custom-providers.md)           | Custom provider config: Z.AI, Alibaba/Qwen, ACP agents, profiles, custom binaries                                              |
@@ -70,8 +71,9 @@ See [docs/development.md](docs/development.md) for full setup, build sync requir
   - Never re-run a test suite that another agent already ran and reported green — trust the result.
   - For full suite verification, push to CI and check GitHub Actions instead.
 - **Always run typecheck and lint after every change.**
-- **Build workspace packages before diagnosing cross-package type errors.** This repo consumes generated declarations across workspaces. If typecheck fails in a package that depends on another workspace (especially CLI depending on server/daemon types), rebuild the owning package first so `dist` declarations are current:
-  - `npm run build:daemon` — rebuild highlight, relay, server, and CLI when daemon/server/CLI types may be stale.
+- **Build workspace packages before diagnosing cross-package type errors.** This repo consumes generated declarations across workspaces. If typecheck fails in a package that depends on another workspace, rebuild the owning stack first so `dist` declarations are current:
+  - `npm run build:client` — rebuild protocol and client declarations.
+  - `npm run build:server` — rebuild highlight, relay, protocol, client, server, and CLI when server/CLI types may be stale.
   - Do not patch inferred callback parameters or add local duplicate types just to silence stale declaration errors.
 - **Run `npm run format` before committing.** This repo uses Biome for formatting. Do not manually fix formatting — let the formatter handle it.
 - **Always use npm scripts for linting and formatting.** Do not run tools directly with `npx eslint`, `npx oxfmt`, `npx oxlint`, or package-local binaries. For targeted checks, pass file paths through the npm script:

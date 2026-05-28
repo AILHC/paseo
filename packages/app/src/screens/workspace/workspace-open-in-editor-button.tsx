@@ -1,4 +1,4 @@
-import { type ReactElement, useCallback, useEffect, useMemo } from "react";
+import { type ReactElement, useCallback, useMemo } from "react";
 import {
   ActivityIndicator,
   Pressable,
@@ -9,7 +9,7 @@ import {
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Check, ChevronDown } from "lucide-react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
-import type { EditorTargetDescriptorPayload } from "@server/shared/messages";
+import type { EditorTargetDescriptorPayload } from "@getpaseo/protocol/messages";
 import { EditorAppIcon } from "@/components/icons/editor-app-icons";
 import { GitHubIcon } from "@/components/icons/github-icon";
 import {
@@ -177,13 +177,6 @@ export function WorkspaceOpenInEditorButton({
     [targetIds, preferredEditorId],
   );
   const primaryOption = targets.find((target) => target.id === effectivePreferredEditorId) ?? null;
-
-  useEffect(() => {
-    if (!effectivePreferredEditorId || effectivePreferredEditorId === preferredEditorId) {
-      return;
-    }
-    void updatePreferredEditor(effectivePreferredEditorId).catch(() => undefined);
-  }, [effectivePreferredEditorId, preferredEditorId, updatePreferredEditor]);
 
   const openMutation = useMutation({
     mutationFn: (target: OpenTarget) => Promise.resolve(target.onOpen()),

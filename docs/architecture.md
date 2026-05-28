@@ -22,13 +22,13 @@ Your code never leaves your machine. Paseo is local-first.
             │  (Node.js)  │
             └──────┬──────┘
                    │
-      ┌────────────┼────────────┐
-      │            │            │
-┌─────▼─────┐ ┌───▼────┐ ┌────▼─────┐
-│  Claude   │ │ Codex  │ │ OpenCode │
-│  Agent    │ │ Agent  │ │  Agent   │
-│  SDK      │ │ Server │ │          │
-└───────────┘ └────────┘ └──────────┘
+      ┌────────────┼────────────┬────────────┬────────────┐
+      │            │            │            │            │
+┌─────▼─────┐ ┌───▼────┐ ┌──────▼─────┐ ┌────▼─────┐ ┌────▼────┐
+│  Claude   │ │ Codex  │ │  Copilot   │ │ OpenCode │ │   Pi    │
+│  Agent    │ │ Agent  │ │   Agent    │ │  Agent   │ │ Agent   │
+│  SDK      │ │ Server │ │    ACP     │ │          │ │         │
+└───────────┘ └────────┘ └────────────┘ └──────────┘ └─────────┘
 ```
 
 ## Components at a glance
@@ -68,9 +68,20 @@ All paths are under `packages/server/src/`.
 | `server/schedule/`              | Cron-based scheduled agents                                                  |
 | `server/loop-service.ts`        | Looping agent runs that retry until an exit condition                        |
 | `server/chat/`                  | Chat rooms for agent-to-agent and human-to-agent messaging                   |
-| `client/daemon-client.ts`       | Client library for connecting to the daemon (used by CLI and app)            |
-| `shared/messages.ts`            | Zod schemas for the entire wire protocol                                     |
-| `shared/binary-frames/`         | Terminal stream and file transfer binary frame codecs                        |
+
+### `packages/protocol` — Wire schemas and shared protocol types
+
+The source of truth for WebSocket messages, binary frame codecs, endpoint parsing,
+agent timeline types, provider config schemas, and other values shared by daemon
+and clients. Server, app, CLI, and `@getpaseo/client` all depend on this package;
+it does not depend on the server.
+
+### `packages/client` — Daemon client library and SDK facade
+
+Owns the low-level daemon WebSocket driver plus the higher-level `PaseoClient`
+facade. App and CLI may import the low-level driver from
+`@getpaseo/client/internal/daemon-client` during migration, while new SDK-shaped
+code imports from `@getpaseo/client`.
 
 ### `packages/app` — Mobile + web client (Expo)
 
@@ -79,6 +90,7 @@ Cross-platform React Native app that connects to one or more daemons.
 - Expo Router navigation (`/h/[serverId]/workspace/[workspaceId]`, `/h/[serverId]/agent/[agentId]`, etc.)
 - `HostRuntimeController` manages saved host connections, reconnection, and per-host runtime state
 - `SessionContext` wraps the daemon client for the active session
+- Composer UI and submit/draft behavior live in `packages/app/src/composer/`; screens and panels should integrate it from there instead of dropping composer internals into `components/`, `hooks/`, or `screens/workspace/`
 - Timeline reducers in `timeline/session-stream-reducers.ts` handle compaction, gap detection, sequence-based deduplication
 - Voice features: dictation (STT) and voice agent (realtime)
 
@@ -125,7 +137,7 @@ TanStack Router + Cloudflare Workers. Serves paseo.sh.
 
 ## WebSocket protocol
 
-All clients speak the same WebSocket protocol over a single connection that mixes JSON text frames and a small binary framing for terminal streams. Schemas live in `packages/server/src/shared/messages.ts`.
+All clients speak the same WebSocket protocol over a single connection that mixes JSON text frames and a small binary framing for terminal streams. Schemas live in `packages/protocol/src/messages.ts`.
 
 **Handshake:**
 
@@ -145,6 +157,8 @@ Server → Client:  status message with payload { status: "server_info",
 There is no dedicated welcome message; the server emits a `status` session message after accepting the hello, then begins streaming. The session stores client capabilities from the hello and rehydrates them on reconnect, so the wire boundary can ask one question: `session.supports(...)`.
 
 **Top-level WS envelopes** are `hello`, `recording_state`, `ping`/`pong`, and `session` (which wraps the rich union of session messages).
+
+Client liveness checks use the top-level JSON `ping`/`pong` envelope, not a session RPC and not RFC6455 protocol ping. The app runs through browser and React Native WebSocket APIs, which do not expose protocol ping, so this envelope is the portable way to test the direct or relay data path. Session RPC timeouts are operation failures and must not be treated as proof that the socket is dead.
 
 New session RPCs use dotted names with `.request` and `.response` suffixes, such as `checkout.github.set_auto_merge.request` and `checkout.github.set_auto_merge.response`. See [rpc-namespacing.md](rpc-namespacing.md) for the convention and migration rules for older flat RPC names.
 
@@ -215,16 +229,17 @@ initializing → idle ⇄ running
 
 Each provider implements the `AgentClient` interface in `agent/agent-sdk-types.ts`. Provider implementations live in `agent/providers/`.
 
-The three first-class, user-facing providers are Claude Code, Codex, and OpenCode. Additional adapters exist in the same directory for ACP-compatible agents and internal use:
+The built-in, user-facing providers are Claude Code, Codex, Copilot, OpenCode, and Pi. Additional adapters exist in the same directory for ACP-compatible agents and internal use:
 
 | Provider           | Wraps                                | Session format                                     |
 | ------------------ | ------------------------------------ | -------------------------------------------------- |
 | Claude (`claude/`) | Anthropic Agent SDK                  | `~/.claude/projects/{cwd}/{session-id}.jsonl`      |
 | Codex              | Codex AppServer (`codex-app-server`) | `~/.codex/sessions/{date}/rollout-{ts}-{id}.jsonl` |
+| Copilot            | GitHub Copilot via ACP               | Provider-managed                                   |
 | OpenCode           | OpenCode server / CLI                | Provider-managed                                   |
-| Cursor / Copilot   | ACP wrapper (`acp-agent`)            | Provider-managed                                   |
+| Cursor             | ACP wrapper (`acp-agent`)            | Provider-managed                                   |
 | Generic ACP        | ACP wrapper                          | Provider-managed                                   |
-| Pi-direct          | Direct Anthropic API call            | Stateless                                          |
+| Pi                 | Local Pi RPC process                 | Provider-managed                                   |
 | Mock load test     | In-process fake                      | In-memory                                          |
 
 All providers:

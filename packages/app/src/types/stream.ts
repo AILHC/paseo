@@ -1,5 +1,5 @@
-import type { AgentProvider, ToolCallDetail } from "@server/server/agent/agent-sdk-types";
-import type { AgentAttachment, AgentStreamEventPayload } from "@server/shared/messages";
+import type { AgentProvider, ToolCallDetail } from "@getpaseo/protocol/agent-types";
+import type { AgentAttachment, AgentStreamEventPayload } from "@getpaseo/protocol/messages";
 import type { AttachmentMetadata } from "@/attachments/types";
 import { extractTaskEntriesFromToolCall } from "../utils/tool-call-parsers";
 import { splitMarkdownBlocks } from "@/utils/split-markdown-blocks";
@@ -59,9 +59,20 @@ export interface UserMessageItem {
   id: string;
   text: string;
   timestamp: Date;
+  optimistic?: true;
   images?: UserMessageImageAttachment[];
   attachments?: AgentAttachment[];
 }
+
+export interface OptimisticUserMessageInput {
+  id: string;
+  text: string;
+  timestamp: Date;
+  images?: UserMessageImageAttachment[];
+  attachments?: AgentAttachment[];
+}
+
+export type OptimisticUserMessagePlacement = "tail" | "active-head";
 
 export interface AssistantMessageItem {
   kind: "assistant_message";
@@ -184,6 +195,86 @@ function markThoughtReady(item: ThoughtItem): ThoughtItem {
   };
 }
 
+function buildUserMessageItem(input: {
+  id: string;
+  text: string;
+  timestamp: Date;
+  optimistic?: UserMessageItem | null;
+}): UserMessageItem {
+  if (input.optimistic) {
+    return {
+      kind: "user_message",
+      id: input.id,
+      text: input.optimistic.text,
+      timestamp: input.optimistic.timestamp,
+      ...(input.optimistic.images && input.optimistic.images.length > 0
+        ? { images: input.optimistic.images }
+        : {}),
+      ...(input.optimistic.attachments && input.optimistic.attachments.length > 0
+        ? { attachments: input.optimistic.attachments }
+        : {}),
+    };
+  }
+
+  return {
+    kind: "user_message",
+    id: input.id,
+    text: input.text,
+    timestamp: input.timestamp,
+  };
+}
+
+export function buildOptimisticUserMessage(input: OptimisticUserMessageInput): UserMessageItem {
+  return {
+    kind: "user_message",
+    id: input.id,
+    text: input.text,
+    timestamp: input.timestamp,
+    optimistic: true,
+    ...(input.images && input.images.length > 0 ? { images: input.images } : {}),
+    ...(input.attachments && input.attachments.length > 0
+      ? { attachments: input.attachments }
+      : {}),
+  };
+}
+
+function hasUserMessage(state: StreamItem[]): boolean {
+  return state.some((item) => item.kind === "user_message");
+}
+
+export function appendOptimisticUserMessageToStream(params: {
+  tail: StreamItem[];
+  head: StreamItem[];
+  message: UserMessageItem;
+  placement: OptimisticUserMessagePlacement;
+  skipIfUserMessageExists?: boolean;
+}): ApplyStreamEventResult {
+  const { tail, head, message, placement } = params;
+  if (
+    tail.some((item) => item.id === message.id) ||
+    head.some((item) => item.id === message.id) ||
+    (params.skipIfUserMessageExists && (hasUserMessage(tail) || hasUserMessage(head)))
+  ) {
+    return { tail, head, changedTail: false, changedHead: false };
+  }
+
+  if (placement === "active-head" && head.length > 0) {
+    return {
+      tail,
+      head: [...head, message],
+      changedTail: false,
+      changedHead: true,
+    };
+  }
+
+  return {
+    tail: [...tail, message],
+    head,
+    changedTail: true,
+    changedHead: false,
+  };
+}
+
 function appendUserMessage(
   state: StreamItem[],
   text: string,
@@ -197,30 +288,30 @@ function appendUserMessage(
 
   const chunkSeed = chunk.trim() || chunk;
   const entryId = messageId ?? createUniqueTimelineId(state, "user", chunkSeed, timestamp);
-  const existingIndex = state.findIndex(
-    (entry) => entry.kind === "user_message" && entry.id === entryId,
+  const optimisticIndex = state.findIndex(
+    (entry) => entry.kind === "user_message" && entry.optimistic,
   );
-  const existing =
-    existingIndex >= 0 && state[existingIndex]?.kind === "user_message"
-      ? state[existingIndex]
-      : null;
-  const preservedImages = existing?.images;
+  const optimistic = optimisticIndex >= 0 ? (state[optimisticIndex] as UserMessageItem) : null;
 
-  const nextItem: UserMessageItem = {
-    kind: "user_message",
+  const nextItem = buildUserMessageItem({
     id: entryId,
     text: chunk,
     timestamp,
-    ...(preservedImages && preservedImages.length > 0 ? { images: preservedImages } : {}),
-  };
+    optimistic,
+  });
 
-  if (existingIndex >= 0) {
+  if (optimisticIndex >= 0) {
     const next = [...state];
-    next[existingIndex] = nextItem;
+    next[optimisticIndex] = nextItem;
     return next;
   }
 
   return [...state, nextItem];
+}
+
+export function clearOptimisticUserMessages(state: StreamItem[]): StreamItem[] {
+  const next = state.filter((item) => item.kind !== "user_message" || !item.optimistic);
+  return next.length === state.length ? state : next;
 }
 
 function appendAssistantMessage(

@@ -20,6 +20,8 @@ import {
   useWindowDimensions,
   type LayoutChangeEvent,
   type PressableStateCallbackType,
+  type StyleProp,
+  type ViewStyle,
 } from "react-native";
 import { StyleSheet, useUnistyles } from "react-native-unistyles";
 import { useIsCompactFormFactor } from "@/constants/layout";
@@ -56,6 +58,7 @@ import {
   SheetHeaderView,
   type SheetHeader,
 } from "@/components/adaptive-modal-sheet";
+import { FloatingSurface } from "@/components/ui/floating";
 
 const IS_WEB = isWeb;
 
@@ -153,7 +156,6 @@ function ComboboxSheetBackground({ style }: BottomSheetBackgroundProps) {
 
 export interface SearchInputProps {
   placeholder: string;
-  value: string;
   onChangeText: (text: string) => void;
   onSubmitEditing?: () => void;
   autoFocus?: boolean;
@@ -163,7 +165,6 @@ export interface SearchInputProps {
 
 export function SearchInput({
   placeholder,
-  value,
   onChangeText,
   onSubmitEditing,
   autoFocus = false,
@@ -191,10 +192,7 @@ export function SearchInput({
           // @ts-expect-error - outlineStyle is web-only
           style={SEARCH_INPUT_STYLE}
           placeholder={placeholder}
-          placeholderTextColor={theme.colors.foregroundMuted}
-          initialValue={value}
           resetKey={resetKey}
-          value={value}
           onChangeText={onChangeText}
           autoCapitalize="none"
           autoCorrect={false}
@@ -202,12 +200,12 @@ export function SearchInput({
         />
       ) : (
         <TextInput
+          key={resetKey}
           ref={inputRef}
           // @ts-expect-error - outlineStyle is web-only
           style={SEARCH_INPUT_STYLE}
           placeholder={placeholder}
           placeholderTextColor={theme.colors.foregroundMuted}
-          value={value}
           onChangeText={onChangeText}
           autoCapitalize="none"
           autoCorrect={false}
@@ -858,7 +856,7 @@ interface DesktopContainerStyleInput {
   availableHeight: number | undefined;
 }
 
-function buildDesktopContainerStyle(input: DesktopContainerStyleInput) {
+function buildDesktopFrameStyle(input: DesktopContainerStyleInput): StyleProp<ViewStyle> {
   const {
     desktopMinWidth,
     referenceWidth,
@@ -877,7 +875,6 @@ function buildDesktopContainerStyle(input: DesktopContainerStyleInput) {
       ? { maxHeight: Math.min(availableHeight, desktopFixedHeight ?? 400) }
       : null;
   return [
-    styles.desktopContainer,
     {
       position: "absolute" as const,
       minWidth: desktopMinWidth ?? referenceWidth ?? 200,
@@ -1040,7 +1037,6 @@ function MobileComboboxBody(props: MobileBodyProps): ReactElement {
           {!props.hasChildren && props.searchable ? (
             <SearchInput
               placeholder={props.searchPlaceholder}
-              value={props.searchQuery}
               onChangeText={props.setSearchQueryWithCallback}
               onSubmitEditing={props.handleSubmitSearch}
               autoFocus={false}
@@ -1070,7 +1066,7 @@ interface DesktopBodyProps {
   handleClose: () => void;
   refs: ReturnType<typeof useFloating>["refs"];
   shouldUseDesktopFade: boolean;
-  desktopContainerStyle: unknown;
+  desktopFrameStyle: StyleProp<ViewStyle>;
   handleDesktopContentLayout: (event: LayoutChangeEvent) => void;
   header: SheetHeader | undefined;
   stickyHeader: ReactNode;
@@ -1149,7 +1145,6 @@ function DesktopComboboxOptionsBody(props: {
       {props.header || !props.searchable ? null : (
         <SearchInput
           placeholder={props.searchPlaceholder}
-          value={props.searchQuery}
           onChangeText={props.setSearchQueryWithCallback}
           onSubmitEditing={props.handleSubmitSearch}
           autoFocus
@@ -1191,11 +1186,12 @@ function DesktopComboboxBody(props: DesktopBodyProps): ReactElement {
     >
       <View ref={props.refs.setOffsetParent} collapsable={false} style={styles.desktopOverlay}>
         <Pressable style={styles.desktopBackdrop} onPress={props.handleClose} />
-        <Animated.View
+        <FloatingSurface
           testID="combobox-desktop-container"
           entering={props.shouldUseDesktopFade ? FadeIn.duration(100) : undefined}
           exiting={props.shouldUseDesktopFade ? FadeOut.duration(100) : undefined}
-          style={props.desktopContainerStyle as never}
+          style={styles.desktopContainer}
+          frameStyle={props.desktopFrameStyle}
           ref={props.refs.setFloating}
           collapsable={false}
           onLayout={props.handleDesktopContentLayout}
@@ -1227,7 +1223,7 @@ function DesktopComboboxBody(props: DesktopBodyProps): ReactElement {
               renderOption={props.renderOption}
             />
           )}
-        </Animated.View>
+        </FloatingSurface>
       </View>
     </Modal>
   );
@@ -1492,9 +1488,9 @@ export function Combobox({
     [theme.colors.palette.zinc],
   );
 
-  const desktopContainerStyle = useMemo(
+  const desktopFrameStyle = useMemo(
     () =>
-      buildDesktopContainerStyle({
+      buildDesktopFrameStyle({
         desktopMinWidth,
         referenceWidth,
         desktopFixedHeight,
@@ -1561,7 +1557,7 @@ export function Combobox({
       handleClose={handleClose}
       refs={refs}
       shouldUseDesktopFade={shouldUseDesktopFade}
-      desktopContainerStyle={desktopContainerStyle}
+      desktopFrameStyle={desktopFrameStyle}
       handleDesktopContentLayout={handleDesktopContentLayout}
       header={header}
       stickyHeader={stickyHeader}

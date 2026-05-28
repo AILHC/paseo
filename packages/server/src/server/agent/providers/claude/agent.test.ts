@@ -56,6 +56,49 @@ describe("convertClaudeHistoryEntry", () => {
     expect(Array.isArray(mapBlocks.mock.calls[0][0])).toBe(true);
   });
 
+  test("replays persisted Claude tool results as completed tool calls", () => {
+    const entry = {
+      type: "user",
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "toolu_persisted",
+            content: "done",
+          },
+        ],
+      },
+      toolUseResult: {
+        stdout: "done",
+        stderr: "",
+        interrupted: false,
+      },
+    };
+
+    const completedToolCall: AgentTimelineItem[] = [
+      {
+        type: "tool_call",
+        callId: "toolu_persisted",
+        name: "Bash",
+        status: "completed",
+        detail: {
+          type: "shell",
+          command: "echo done",
+          output: "done",
+          exitCode: 0,
+        },
+        error: null,
+      },
+    ];
+
+    const mapPersistedToolResultBlocks = (): AgentTimelineItem[] => completedToolCall;
+
+    expect(convertClaudeHistoryEntry(entry, mapPersistedToolResultBlocks)).toEqual(
+      completedToolCall,
+    );
+  });
+
   test("returns user messages when no tool blocks exist", () => {
     const entry = {
       type: "user",
@@ -358,6 +401,8 @@ describe("ClaudeAgentClient.listModels", () => {
     const models = await client.listModels({ cwd: "/tmp/claude-models", force: false });
 
     expect(models.map((m) => m.id)).toEqual([
+      "claude-opus-4-8[1m]",
+      "claude-opus-4-8",
       "claude-opus-4-7[1m]",
       "claude-opus-4-7",
       "claude-opus-4-6[1m]",
@@ -373,7 +418,7 @@ describe("ClaudeAgentClient.listModels", () => {
     }
 
     const defaultModel = models.find((m) => m.isDefault);
-    expect(defaultModel?.id).toBe("claude-opus-4-6");
+    expect(defaultModel?.id).toBe("claude-opus-4-8");
   });
 });
 
@@ -1460,5 +1505,71 @@ describe("ClaudeAgentSession context window usage", () => {
     const timelineEvents = events.filter((event) => event.type === "timeline");
     expect(timelineEvents).toEqual([]);
     expect(events.some((event) => event.type === "turn_completed")).toBe(true);
+  });
+
+  test("result.result is not duplicated when assistant text already streamed with zero token usage", async () => {
+    const queryFactory = createQueryFactoryForTurns([
+      [
+        {
+          type: "system",
+          subtype: "init",
+          session_id: "session-third-party",
+          permissionMode: "default",
+        },
+        {
+          type: "assistant",
+          message: {
+            id: "assistant-third-party-1",
+            role: "assistant",
+            content: [{ type: "text", text: "Here is the answer." }],
+            usage: {
+              input_tokens: 0,
+              output_tokens: 0,
+            },
+          },
+          session_id: "session-third-party",
+          uuid: "assistant-third-party-event-1",
+        },
+        {
+          type: "result",
+          subtype: "success",
+          result: "Here is the answer.",
+          is_error: false,
+          duration_ms: 100,
+          duration_api_ms: 80,
+          num_turns: 1,
+          stop_reason: null,
+          total_cost_usd: 0.01,
+          usage: {
+            input_tokens: 10,
+            cache_read_input_tokens: 0,
+            output_tokens: 0,
+          },
+          permission_denials: [],
+          uuid: "result-third-party-1",
+          session_id: "session-third-party",
+        },
+      ],
+    ]);
+    const client = new ClaudeAgentClient({
+      logger,
+      queryFactory,
+      resolveBinary: async () => "/test/claude/bin",
+    });
+    const session = await client.createSession({
+      provider: "claude",
+      cwd: process.cwd(),
+    });
+
+    const result = await session.run("turn");
+    await session.close();
+
+    expect(result.timeline).toEqual([
+      {
+        type: "assistant_message",
+        text: "Here is the answer.",
+        messageId: "assistant-third-party-1",
+      },
+    ]);
   });
 });

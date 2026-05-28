@@ -1,8 +1,8 @@
-import type { AgentStreamEventPayload } from "@server/shared/messages";
-import type { AgentLifecycleStatus } from "@server/shared/agent-lifecycle";
+import type { AgentStreamEventPayload } from "@getpaseo/protocol/messages";
+import type { AgentLifecycleStatus } from "@getpaseo/protocol/agent-lifecycle";
 import type { Agent } from "@/stores/session-store";
 import { useSessionStore } from "@/stores/session-store";
-import type { StreamItem } from "@/types/stream";
+import type { StreamItem, UserMessageItem } from "@/types/stream";
 import {
   applyStreamEvent,
   hydrateStreamState,
@@ -240,15 +240,22 @@ function applyTimelineReplacePath(args: {
   timelineUnits: TimelineUnit[];
   payload: ProcessTimelineResponseInput["payload"];
   bootstrapPolicy: ReturnType<typeof deriveBootstrapTailTimelinePolicy>;
+  currentTail: StreamItem[];
   currentHead: StreamItem[];
   toHydratedEvents: (
     units: TimelineUnit[],
   ) => Array<{ event: AgentStreamEventPayload; timestamp: Date }>;
 }): TimelinePathResult {
-  const { timelineUnits, payload, bootstrapPolicy, currentHead, toHydratedEvents } = args;
+  const { timelineUnits, payload, bootstrapPolicy, currentTail, currentHead, toHydratedEvents } =
+    args;
   const hydratedTail = hydrateStreamState(toHydratedEvents(timelineUnits), { source: "canonical" });
+  const reconciledTail = reconcileOptimisticUsersAfterReplace({
+    canonicalTail: hydratedTail,
+    previousTail: currentTail,
+    previousHead: currentHead,
+  });
   const { tail, head } = preserveReplacePathAssistantHead({
-    tail: hydratedTail,
+    tail: reconciledTail,
     currentHead,
   });
   const cursor: TimelineCursor | null =
@@ -264,6 +271,92 @@ function applyTimelineReplacePath(args: {
     sideEffects.push({ type: "catch_up", cursor: bootstrapPolicy.catchUpCursor });
   }
   return { tail, head, cursor, cursorChanged: true, sideEffects };
+}
+
+function collectOptimisticUserMessages(items: StreamItem[]): Array<{
+  ordinal: number;
+  item: UserMessageItem;
+}> {
+  const optimistic: Array<{ ordinal: number; item: UserMessageItem }> = [];
+  let ordinal = 0;
+  for (const item of items) {
+    if (item.kind !== "user_message") {
+      continue;
+    }
+    if (item.optimistic) {
+      optimistic.push({ ordinal, item });
+    }
+    ordinal += 1;
+  }
+  return optimistic;
+}
+
+function mergeCanonicalUserWithOptimistic(
+  canonical: UserMessageItem,
+  optimistic: UserMessageItem,
+): UserMessageItem {
+  return {
+    kind: "user_message",
+    id: canonical.id,
+    text: optimistic.text,
+    timestamp: optimistic.timestamp,
+    ...(optimistic.images && optimistic.images.length > 0 ? { images: optimistic.images } : {}),
+    ...(optimistic.attachments && optimistic.attachments.length > 0
+      ? { attachments: optimistic.attachments }
+      : {}),
+  };
+}
+
+function reconcileOptimisticUsersAfterReplace(params: {
+  canonicalTail: StreamItem[];
+  previousTail: StreamItem[];
+  previousHead: StreamItem[];
+}): StreamItem[] {
+  const optimisticUsers = collectOptimisticUserMessages([
+    ...params.previousTail,
+    ...params.previousHead,
+  ]);
+  if (optimisticUsers.length === 0) {
+    return params.canonicalTail;
+  }
+
+  const canonicalUserIndexes: number[] = [];
+  params.canonicalTail.forEach((item, index) => {
+    if (item.kind === "user_message") {
+      canonicalUserIndexes.push(index);
+    }
+  });
+
+  let changed = false;
+  const nextTail = [...params.canonicalTail];
+  let searchFromOrdinal = 0;
+  const unmatched: UserMessageItem[] = [];
+
+  for (const optimistic of optimisticUsers) {
+    const canonicalOrdinal = canonicalUserIndexes.findIndex(
+      (_index, ordinal) => ordinal >= Math.max(optimistic.ordinal, searchFromOrdinal),
+    );
+    if (canonicalOrdinal < 0) {
+      unmatched.push(optimistic.item);
+      continue;
+    }
+
+    const canonicalIndex = canonicalUserIndexes[canonicalOrdinal];
+    const canonicalItem = canonicalIndex !== undefined ? nextTail[canonicalIndex] : undefined;
+    if (!canonicalItem || canonicalItem.kind !== "user_message") {
+      unmatched.push(optimistic.item);
+      continue;
+    }
+    nextTail[canonicalIndex] = mergeCanonicalUserWithOptimistic(canonicalItem, optimistic.item);
+    searchFromOrdinal = canonicalOrdinal + 1;
+    changed = true;
+  }
+
+  if (unmatched.length === 0) {
+    return changed ? nextTail : params.canonicalTail;
+  }
+
+  return [...nextTail, ...unmatched];
 }
 
 interface IncrementalAcceptResult {
@@ -531,6 +624,7 @@ export function processTimelineResponse(
         timelineUnits,
         payload,
         bootstrapPolicy,
+        currentTail,
         currentHead,
         toHydratedEvents,
       })
@@ -623,6 +717,14 @@ export interface AgentStreamReducerEvent {
   timestamp: Date;
 }
 
+interface TimelineSequencingGateResult {
+  shouldApplyStreamEvent: boolean;
+  nextTimelineCursor: TimelineCursor | null;
+  cursorChanged: boolean;
+  resetLiveTimeline: boolean;
+  sideEffects: AgentStreamReducerSideEffect[];
+}
+
 export interface AgentStreamReducerAgentSnapshot {
   status: AgentLifecycleStatus;
   updatedAt: Date;
@@ -672,61 +774,91 @@ function applyAgentPatch(
   };
 }
 
+function processTimelineSequencingGate(input: {
+  event: AgentStreamEventPayload;
+  seq: number | undefined;
+  epoch: string | undefined;
+  currentCursor: TimelineCursor | undefined;
+}): TimelineSequencingGateResult {
+  const { event, seq, epoch, currentCursor } = input;
+  const base: TimelineSequencingGateResult = {
+    shouldApplyStreamEvent: true,
+    nextTimelineCursor: null,
+    cursorChanged: false,
+    resetLiveTimeline: false,
+    sideEffects: [],
+  };
+  if (event.type !== "timeline" || typeof seq !== "number" || typeof epoch !== "string") {
+    return base;
+  }
+
+  const decision = classifySessionTimelineSeq({
+    cursor: currentCursor ? { epoch: currentCursor.epoch, endSeq: currentCursor.endSeq } : null,
+    epoch,
+    seq,
+  });
+
+  if (decision === "init") {
+    return {
+      ...base,
+      nextTimelineCursor: { epoch, startSeq: seq, endSeq: seq },
+      cursorChanged: true,
+    };
+  }
+  if (decision === "accept") {
+    return {
+      ...base,
+      nextTimelineCursor: {
+        ...(currentCursor ?? { epoch, startSeq: seq, endSeq: seq }),
+        epoch,
+        endSeq: seq,
+      },
+      cursorChanged: true,
+    };
+  }
+  if (decision === "gap") {
+    return {
+      ...base,
+      shouldApplyStreamEvent: false,
+      sideEffects: currentCursor
+        ? [
+            {
+              type: "catch_up",
+              cursor: { epoch: currentCursor.epoch, endSeq: currentCursor.endSeq },
+            },
+          ]
+        : [],
+    };
+  }
+  if (decision === "drop_epoch" && seq === 1) {
+    return {
+      ...base,
+      nextTimelineCursor: { epoch, startSeq: seq, endSeq: seq },
+      cursorChanged: true,
+      resetLiveTimeline: true,
+    };
+  }
+  return {
+    ...base,
+    shouldApplyStreamEvent: false,
+  };
+}
+
 export function processAgentStreamEvent(
   input: ProcessAgentStreamEventInput,
 ): ProcessAgentStreamEventOutput {
   const { event, seq, epoch, currentTail, currentHead, currentCursor, currentAgent, timestamp } =
     input;
 
-  let shouldApplyStreamEvent = true;
-  let nextTimelineCursor: TimelineCursor | null = null;
-  let cursorChanged = false;
-  const sideEffects: AgentStreamReducerSideEffect[] = [];
-
-  // ------------------------------------------------------------------
-  // Timeline sequencing gate
-  // ------------------------------------------------------------------
-  if (event.type === "timeline" && typeof seq === "number" && typeof epoch === "string") {
-    const decision = classifySessionTimelineSeq({
-      cursor: currentCursor ? { epoch: currentCursor.epoch, endSeq: currentCursor.endSeq } : null,
-      epoch,
-      seq,
-    });
-
-    if (decision === "init") {
-      nextTimelineCursor = { epoch, startSeq: seq, endSeq: seq };
-      cursorChanged = true;
-    } else if (decision === "accept") {
-      nextTimelineCursor = {
-        ...(currentCursor ?? { epoch, startSeq: seq, endSeq: seq }),
-        epoch,
-        endSeq: seq,
-      };
-      cursorChanged = true;
-    } else if (decision === "gap") {
-      shouldApplyStreamEvent = false;
-      if (currentCursor) {
-        sideEffects.push({
-          type: "catch_up",
-          cursor: {
-            epoch: currentCursor.epoch,
-            endSeq: currentCursor.endSeq,
-          },
-        });
-      }
-    } else {
-      // drop_stale or drop_epoch
-      shouldApplyStreamEvent = false;
-    }
-  }
+  const sequencing = processTimelineSequencingGate({ event, seq, epoch, currentCursor });
 
   // ------------------------------------------------------------------
   // Apply stream event to tail/head
   // ------------------------------------------------------------------
-  const { tail, head, changedTail, changedHead } = shouldApplyStreamEvent
+  const { tail, head, changedTail, changedHead } = sequencing.shouldApplyStreamEvent
     ? applyStreamEvent({
-        tail: currentTail,
-        head: currentHead,
+        tail: sequencing.resetLiveTimeline ? [] : currentTail,
+        head: sequencing.resetLiveTimeline ? [] : currentHead,
         event,
         timestamp,
         source: "live",
@@ -771,11 +903,11 @@ export function processAgentStreamEvent(
     head,
     changedTail,
     changedHead,
-    cursor: nextTimelineCursor,
-    cursorChanged,
+    cursor: sequencing.nextTimelineCursor,
+    cursorChanged: sequencing.cursorChanged,
     agent: agentPatch,
     agentChanged,
-    sideEffects,
+    sideEffects: sequencing.sideEffects,
   };
 }
 

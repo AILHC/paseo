@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import invariant from "tiny-invariant";
-import { describe, it } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import {
+  applyStreamEvent,
+  appendOptimisticUserMessageToStream,
+  buildOptimisticUserMessage,
+  clearOptimisticUserMessages,
   hydrateStreamState,
   mergeToolCallDetail,
   reduceStreamUpdate,
@@ -10,9 +14,9 @@ import {
   type StreamItem,
   isAgentToolCallItem,
 } from "./stream";
-import type { AgentProvider, ToolCallDetail } from "@server/server/agent/agent-sdk-types";
-import type { AgentStreamEventPayload } from "@server/shared/messages";
-import { buildToolCallDisplayModel } from "../../../server/src/shared/tool-call-display";
+import type { AgentProvider, ToolCallDetail } from "@getpaseo/protocol/agent-types";
+import type { AgentStreamEventPayload } from "@getpaseo/protocol/messages";
+import { buildToolCallDisplayModel } from "@getpaseo/protocol/tool-call-display";
 
 type CanonicalToolStatus = "running" | "completed" | "failed" | "canceled";
 
@@ -309,7 +313,7 @@ describe("stream reducer canonical tool calls", () => {
     const first = hydrateStreamState(updates);
     const second = hydrateStreamState(updates);
 
-    assert.strictEqual(JSON.stringify(first), JSON.stringify(second));
+    expect(first).toEqual(second);
     const assistantMessage = first.find((item) => item.kind === "assistant_message");
     assert.strictEqual(assistantMessage?.text, "Hello world");
   });
@@ -720,6 +724,7 @@ describe("stream reducer canonical tool calls", () => {
 
   it("preserves optimistic user message images when authoritative user message arrives", () => {
     const messageId = "msg-user-images";
+    const optimisticTimestamp = new Date("2025-01-01T11:10:00Z");
     const optimisticImages = [
       {
         id: "att-optimistic",
@@ -734,7 +739,8 @@ describe("stream reducer canonical tool calls", () => {
         kind: "user_message",
         id: messageId,
         text: "Analyze this image",
-        timestamp: new Date("2025-01-01T11:10:00Z"),
+        timestamp: optimisticTimestamp,
+        optimistic: true,
         images: optimisticImages,
       },
     ];
@@ -755,7 +761,8 @@ describe("stream reducer canonical tool calls", () => {
     assert.ok(message);
     assert.strictEqual(message.id, messageId);
     assert.deepStrictEqual(message.images, optimisticImages);
-    assert.strictEqual(message.timestamp.getTime(), authoritativeTimestamp.getTime());
+    assert.strictEqual(message.text, "Analyze this image");
+    assert.strictEqual(message.timestamp.getTime(), optimisticTimestamp.getTime());
   });
 
   it("keeps canonical assistant/user/assistant order during replay", () => {
@@ -933,6 +940,373 @@ describe("turn lifecycle events", () => {
     assert.deepStrictEqual(
       state.map((item) => item.kind),
       ["user_message", "user_message"],
+    );
+  });
+
+  it.each(["codex", "opencode", "pi"] satisfies AgentProvider[])(
+    "replaces an optimistic user message when a live %s provider-owned id echo arrives without text matching",
+    (provider) => {
+      const optimisticTimestamp = new Date("2025-01-01T15:02:00Z");
+      const serverTimestamp = new Date("2025-01-01T15:02:01Z");
+      const optimistic: StreamItem = {
+        kind: "user_message",
+        id: "msg_optimistic",
+        text: "same user text",
+        timestamp: optimisticTimestamp,
+        optimistic: true,
+        images: [
+          {
+            id: "image-1",
+            mimeType: "image/png",
+            storageType: "web-indexeddb",
+            storageKey: "image-1",
+            createdAt: optimisticTimestamp.getTime(),
+          },
+        ],
+        attachments: [
+          {
+            type: "text",
+            mimeType: "text/plain",
+            text: "attached context",
+            title: "context.txt",
+          },
+        ],
+      };
+
+      const state = reduceStreamUpdate(
+        [optimistic],
+        {
+          type: "timeline",
+          provider,
+          item: {
+            type: "user_message",
+            text: "server-owned rendered text",
+            messageId: "provider-owned-id",
+          },
+        },
+        serverTimestamp,
+        { source: "live" },
+      );
+
+      const userMessages = state.filter((item) => item.kind === "user_message");
+      assert.strictEqual(userMessages.length, 1);
+      const userMessage = userMessages[0];
+      invariant(userMessage?.kind === "user_message");
+      assert.strictEqual(userMessage.id, "provider-owned-id");
+      assert.strictEqual(userMessage.text, optimistic.text);
+      assert.strictEqual(userMessage.timestamp.getTime(), optimistic.timestamp.getTime());
+      assert.strictEqual(userMessage.optimistic, undefined);
+      assert.deepStrictEqual(userMessage.images, optimistic.images);
+      assert.deepStrictEqual(userMessage.attachments, optimistic.attachments);
+    },
+  );
+
+  it("replaces one optimistic plain-text user message with the next live server user message", () => {
+    const optimisticTimestamp = new Date("2025-01-01T15:03:00Z");
+    const serverTimestamp = new Date("2025-01-01T15:03:01Z");
+    const optimistic: StreamItem = {
+      kind: "user_message",
+      id: "msg_optimistic",
+      text: "typed plain text",
+      timestamp: optimisticTimestamp,
+      optimistic: true,
+    };
+
+    const state = reduceStreamUpdate(
+      [optimistic],
+      {
+        type: "timeline",
+        provider: "opencode",
+        item: {
+          type: "user_message",
+          text: "typed plain text",
+          messageId: "msg_opencode_provider_owned",
+        },
+      },
+      serverTimestamp,
+      { source: "live" },
+    );
+
+    const userMessages = state.filter((item) => item.kind === "user_message");
+    assert.strictEqual(userMessages.length, 1);
+    const userMessage = userMessages[0];
+    invariant(userMessage?.kind === "user_message");
+    assert.strictEqual(userMessage.id, "msg_opencode_provider_owned");
+    assert.strictEqual(userMessage.text, "typed plain text");
+    assert.strictEqual(userMessage.timestamp.getTime(), optimisticTimestamp.getTime());
+    assert.strictEqual(userMessage.optimistic, undefined);
+  });
+
+  it("replaces an optimistic image user message with the next canonical server user message", () => {
+    const optimisticTimestamp = new Date("2025-01-01T15:03:10Z");
+    const image = {
+      id: "image-canonical",
+      mimeType: "image/png",
+      storageType: "web-indexeddb" as const,
+      storageKey: "image-canonical",
+      createdAt: optimisticTimestamp.getTime(),
+    };
+    const attachment = {
+      type: "text" as const,
+      mimeType: "text/plain" as const,
+      text: "context",
+      title: "context.txt",
+    };
+    const optimistic = buildOptimisticUserMessage({
+      id: "msg_optimistic_canonical",
+      text: "Analyze this",
+      timestamp: optimisticTimestamp,
+      images: [image],
+      attachments: [attachment],
+    });
+
+    const state = reduceStreamUpdate(
+      [optimistic],
+      {
+        type: "timeline",
+        provider: "claude",
+        item: {
+          type: "user_message",
+          text: "server-rendered attachment text",
+          messageId: "provider-owned-canonical",
+        },
+      },
+      new Date("2025-01-01T15:03:11Z"),
+      { source: "canonical" },
+    );
+
+    const userMessages = state.filter((item) => item.kind === "user_message");
+    assert.strictEqual(userMessages.length, 1);
+    const userMessage = userMessages[0];
+    invariant(userMessage?.kind === "user_message");
+    assert.strictEqual(userMessage.id, "provider-owned-canonical");
+    assert.strictEqual(userMessage.text, "Analyze this");
+    assert.strictEqual(userMessage.timestamp.getTime(), optimisticTimestamp.getTime());
+    assert.strictEqual(userMessage.optimistic, undefined);
+    assert.deepStrictEqual(userMessage.images, [image]);
+    assert.deepStrictEqual(userMessage.attachments, [attachment]);
+  });
+
+  it("places optimistic user messages through one append helper", () => {
+    const optimistic = buildOptimisticUserMessage({
+      id: "msg_append_once",
+      text: "append once",
+      timestamp: new Date("2025-01-01T15:03:20Z"),
+    });
+    const headItem: StreamItem = {
+      kind: "assistant_message",
+      id: "assistant-head",
+      text: "streaming",
+      timestamp: new Date("2025-01-01T15:03:19Z"),
+    };
+
+    const first = appendOptimisticUserMessageToStream({
+      tail: [],
+      head: [headItem],
+      message: optimistic,
+      placement: "active-head",
+    });
+    const second = appendOptimisticUserMessageToStream({
+      tail: first.tail,
+      head: first.head,
+      message: optimistic,
+      placement: "active-head",
+    });
+    const skipped = appendOptimisticUserMessageToStream({
+      tail: [
+        {
+          kind: "user_message",
+          id: "canonical-user",
+          text: "already canonical",
+          timestamp: new Date("2025-01-01T15:03:21Z"),
+        },
+      ],
+      head: [],
+      message: optimistic,
+      placement: "tail",
+      skipIfUserMessageExists: true,
+    });
+
+    assert.deepStrictEqual(first.tail, []);
+    assert.deepStrictEqual(first.head, [headItem, optimistic]);
+    assert.strictEqual(second.changedHead, false);
+    assert.strictEqual(second.head, first.head);
+    assert.strictEqual(skipped.changedTail, false);
+    assert.strictEqual(skipped.tail.length, 1);
+  });
+
+  it("reconciles an optimistic user message that was pending in the streaming head", () => {
+    const optimistic: StreamItem = {
+      kind: "user_message",
+      id: "msg_head_optimistic",
+      text: "plain text in head",
+      timestamp: new Date("2025-01-01T15:03:02Z"),
+      optimistic: true,
+    };
+
+    const result = applyStreamEvent({
+      tail: [],
+      head: [optimistic],
+      event: {
+        type: "timeline",
+        provider: "opencode",
+        item: {
+          type: "user_message",
+          text: "plain text in head",
+          messageId: "provider-owned-head",
+        },
+      },
+      timestamp: new Date("2025-01-01T15:03:03Z"),
+      source: "live",
+    });
+
+    assert.strictEqual(result.head.length, 0);
+    const userMessages = result.tail.filter((item) => item.kind === "user_message");
+    assert.strictEqual(userMessages.length, 1);
+    assert.strictEqual(userMessages[0]?.id, "provider-owned-head");
+    assert.strictEqual(userMessages[0]?.optimistic, undefined);
+  });
+
+  it("replaces multiple optimistic user messages in FIFO order", () => {
+    const optimisticTimestamp = new Date("2025-01-01T15:04:00Z");
+    const serverTimestamp = new Date("2025-01-01T15:04:01Z");
+    const firstOptimistic: StreamItem = {
+      kind: "user_message",
+      id: "msg_optimistic_1",
+      text: "first typed text",
+      timestamp: optimisticTimestamp,
+      optimistic: true,
+    };
+    const secondOptimistic: StreamItem = {
+      kind: "user_message",
+      id: "msg_optimistic_2",
+      text: "second typed text",
+      timestamp: new Date("2025-01-01T15:04:00.500Z"),
+      optimistic: true,
+    };
+
+    const afterFirstEcho = reduceStreamUpdate(
+      [firstOptimistic, secondOptimistic],
+      {
+        type: "timeline",
+        provider: "opencode",
+        item: {
+          type: "user_message",
+          text: "first server text",
+          messageId: "provider-owned-first",
+        },
+      },
+      serverTimestamp,
+      { source: "live" },
+    );
+    const state = reduceStreamUpdate(
+      afterFirstEcho,
+      {
+        type: "timeline",
+        provider: "opencode",
+        item: {
+          type: "user_message",
+          text: "second server text",
+          messageId: "provider-owned-second",
+        },
+      },
+      new Date("2025-01-01T15:04:02Z"),
+      { source: "live" },
+    );
+
+    const userMessages = state.filter((item) => item.kind === "user_message");
+    assert.strictEqual(userMessages.length, 2);
+    assert.deepStrictEqual(
+      userMessages.map((item) => [item.id, item.text, item.optimistic]),
+      [
+        ["provider-owned-first", "first typed text", undefined],
+        ["provider-owned-second", "second typed text", undefined],
+      ],
+    );
+  });
+
+  it("appends a live server user message when no optimistic user message is pending", () => {
+    const state = reduceStreamUpdate(
+      [],
+      {
+        type: "timeline",
+        provider: "opencode",
+        item: {
+          type: "user_message",
+          text: "resumed session text",
+          messageId: "provider-owned-resume",
+        },
+      },
+      new Date("2025-01-01T15:04:03Z"),
+      { source: "live" },
+    );
+
+    const userMessages = state.filter((item) => item.kind === "user_message");
+    assert.strictEqual(userMessages.length, 1);
+    assert.strictEqual(userMessages[0]?.id, "provider-owned-resume");
+    assert.strictEqual(userMessages[0]?.optimistic, undefined);
+  });
+
+  it("does not match a server user message to an optimistic from a rewound turn after pending optimistics are cleared", () => {
+    const optimistic: StreamItem = {
+      kind: "user_message",
+      id: "msg_rewound_optimistic",
+      text: "rewound text",
+      timestamp: new Date("2025-01-01T15:04:04Z"),
+      optimistic: true,
+    };
+    const cleared = clearOptimisticUserMessages([optimistic]);
+
+    const state = reduceStreamUpdate(
+      cleared,
+      {
+        type: "timeline",
+        provider: "opencode",
+        item: {
+          type: "user_message",
+          text: "future server echo",
+          messageId: "provider-owned-after-rewind",
+        },
+      },
+      new Date("2025-01-01T15:04:05Z"),
+      { source: "live" },
+    );
+
+    const userMessages = state.filter((item) => item.kind === "user_message");
+    assert.strictEqual(userMessages.length, 1);
+    assert.strictEqual(userMessages[0]?.id, "provider-owned-after-rewind");
+    assert.strictEqual(userMessages[0]?.text, "future server echo");
+    assert.strictEqual(userMessages[0]?.optimistic, undefined);
+  });
+
+  it("keeps canonical repeated user messages distinct during hydration", () => {
+    const state = hydrateStreamState(
+      [
+        {
+          event: {
+            type: "timeline",
+            provider: "codex",
+            item: { type: "user_message", text: "repeat", messageId: "native-1" },
+          },
+          timestamp: new Date("2025-01-01T15:03:00Z"),
+        },
+        {
+          event: {
+            type: "timeline",
+            provider: "codex",
+            item: { type: "user_message", text: "repeat", messageId: "native-2" },
+          },
+          timestamp: new Date("2025-01-01T15:03:01Z"),
+        },
+      ],
+      { source: "canonical" },
+    );
+
+    const userMessages = state.filter((item) => item.kind === "user_message");
+    assert.strictEqual(userMessages.length, 2);
+    assert.deepStrictEqual(
+      userMessages.map((item) => item.id),
+      ["native-1", "native-2"],
     );
   });
 });

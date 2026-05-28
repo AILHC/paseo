@@ -27,7 +27,9 @@ Both look the same in storage. This is an accepted limitation — see [Limitatio
 
 Archive is a **soft delete**: the agent record stays on disk with `archivedAt` set, the runtime is closed, and the agent disappears from active lists. Archive is **global** — it lives on the server and propagates to every connected client.
 
-Archiving runs through `AgentManager.archiveSession` (`packages/server/src/server/agent/agent-manager.ts`):
+`create_agent_request` can opt an agent into `autoArchive`. In that mode the daemon archives the agent after the first terminal turn event (`turn_completed`, `turn_failed`, or `turn_canceled`). If the same request created a Paseo worktree through its `worktree` field, auto-archive archives that worktree too, which removes the agent records inside the worktree.
+
+Explicit session archive runs through `AgentManager.archiveSession` (`packages/server/src/server/agent/agent-manager.ts`). Other server-side archive flows still use `AgentManager.archiveAgent`, which delegates to the same archive boundary.
 
 1. Snapshot the current session into the registry
 2. Set `archivedAt` and normalize `lastStatus` away from `running`/`initializing`
@@ -75,7 +77,7 @@ from the track at any time.
 
 ## The subagents track
 
-The collapsible section above the composer in an agent's pane (`packages/app/src/subagents/subagents-section.tsx`). Membership rule (`packages/app/src/subagents/subagents.ts`):
+The collapsible track above the composer in an agent's pane (`packages/app/src/subagents/track.tsx`). Membership rule (`packages/app/src/subagents/select.ts`):
 
 ```
 parentAgentId === thisAgent.id  AND  !archivedAt

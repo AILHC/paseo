@@ -3,8 +3,11 @@ import { homedir } from "node:os";
 import type { SessionConfigOption } from "@agentclientprotocol/sdk";
 
 import type { AgentCapabilityFlags, AgentMode } from "../agent-sdk-types.js";
-import type { ProviderRuntimeSettings } from "../provider-launch-config.js";
-import { findExecutable } from "../../../utils/executable.js";
+import {
+  checkProviderLaunchAvailable,
+  resolveProviderLaunch,
+  type ProviderRuntimeSettings,
+} from "../provider-launch-config.js";
 import {
   ACPAgentClient,
   type ACPBeforeModeWriteResult,
@@ -16,7 +19,7 @@ import {
   formatDiagnosticStatus,
   formatProviderDiagnostic,
   formatProviderDiagnosticError,
-  resolveBinaryVersion,
+  buildBinaryDiagnosticRows,
   toDiagnosticErrorMessage,
 } from "./diagnostic-utils.js";
 
@@ -27,6 +30,9 @@ const COPILOT_CAPABILITIES: AgentCapabilityFlags = {
   supportsMcpServers: true,
   supportsReasoningStream: true,
   supportsToolInvocations: true,
+  supportsRewindConversation: false,
+  supportsRewindFiles: false,
+  supportsRewindBoth: false,
 };
 
 const COPILOT_AGENT_MODE_ID = "https://agentclientprotocol.com/protocol/session-modes#agent";
@@ -85,8 +91,12 @@ export class CopilotACPAgentClient extends ACPAgentClient {
 
   async getDiagnostic(): Promise<{ diagnostic: string }> {
     try {
-      const available = await this.isAvailable();
-      const resolvedBinary = await findExecutable("copilot");
+      const launch = await resolveProviderLaunch({
+        commandConfig: this.runtimeSettings?.command,
+        defaultBinary: "copilot",
+      });
+      const availability = await checkProviderLaunchAvailable(launch);
+      const available = availability.available;
       let modelsValue = "Not checked";
       let status = formatDiagnosticStatus(available);
 
@@ -116,14 +126,7 @@ export class CopilotACPAgentClient extends ACPAgentClient {
 
       return {
         diagnostic: formatProviderDiagnostic("Copilot", [
-          {
-            label: "Binary",
-            value: resolvedBinary ?? "not found",
-          },
-          {
-            label: "Version",
-            value: resolvedBinary ? await resolveBinaryVersion(resolvedBinary) : "unknown",
-          },
+          ...(await buildBinaryDiagnosticRows(launch, availability)),
           { label: "Models", value: modelsValue },
           { label: "Status", value: status },
         ]),

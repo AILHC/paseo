@@ -273,6 +273,12 @@ describe("keyboard-shortcuts", () => {
       action: "sidebar.toggle.both",
     },
     {
+      name: "matches Dvorak logical Cmd+. to toggle both sidebars on macOS",
+      event: { key: ".", code: "KeyE", metaKey: true },
+      context: { isMac: true },
+      action: "sidebar.toggle.both",
+    },
+    {
       name: "routes Mod+D to message-input action outside terminal",
       event: { key: "d", code: "KeyD", metaKey: true },
       context: { isMac: true, focusScope: "message-input" },
@@ -293,6 +299,49 @@ describe("keyboard-shortcuts", () => {
       action: "agent.interrupt",
       preventDefault: false,
       stopPropagation: false,
+    },
+    // macOS rewrites event.key when Option is held (Option+T -> "†",
+    // Option+[ -> "“", Option+Shift+W -> "„", etc.). Every Alt-bound
+    // letter / bracket shortcut must still resolve.
+    {
+      name: "matches Cmd+Alt+T to cycle theme on macOS when Option substitutes event.key",
+      event: { key: "\u2020", code: "KeyT", metaKey: true, altKey: true },
+      context: { isMac: true },
+      action: "theme.cycle",
+    },
+    {
+      name: "matches Alt+Shift+[ to previous tab on macOS when Option substitutes event.key",
+      event: { key: "\u201D", code: "BracketLeft", altKey: true, shiftKey: true },
+      context: { isMac: true },
+      action: "workspace.tab.navigate.relative",
+      payload: { delta: -1 },
+    },
+    {
+      name: "matches Alt+Shift+] to next tab on macOS when Option substitutes event.key",
+      event: { key: "\u2019", code: "BracketRight", altKey: true, shiftKey: true },
+      context: { isMac: true },
+      action: "workspace.tab.navigate.relative",
+      payload: { delta: 1 },
+    },
+    {
+      name: "matches Alt+[ to previous workspace on macOS web when Option substitutes event.key",
+      event: { key: "\u201C", code: "BracketLeft", altKey: true },
+      context: { isMac: true, isDesktop: false },
+      action: "workspace.navigate.relative",
+      payload: { delta: -1 },
+    },
+    {
+      name: "matches Alt+] to next workspace on macOS web when Option substitutes event.key",
+      event: { key: "\u2018", code: "BracketRight", altKey: true },
+      context: { isMac: true, isDesktop: false },
+      action: "workspace.navigate.relative",
+      payload: { delta: 1 },
+    },
+    {
+      name: "matches Alt+Shift+W to close current tab on macOS web when Option substitutes event.key",
+      event: { key: "\u201E", code: "KeyW", altKey: true, shiftKey: true },
+      context: { isMac: true, isDesktop: false },
+      action: "workspace.tab.close.current",
     },
   ];
 
@@ -389,6 +438,19 @@ describe("keyboard-shortcuts", () => {
       name: "keeps space typing available in message input",
       event: { key: " ", code: "Space" },
       context: { focusScope: "message-input" },
+    },
+    {
+      name: "keeps Dvorak Cmd+V available for paste in message input",
+      event: { key: "v", code: "Period", metaKey: true },
+      context: { isMac: true, isDesktop: true, focusScope: "message-input" },
+    },
+    // Sanity: the macOS Option-substitution fallback must still respect
+    // modifier checks — pressing Option+T alone (no Cmd) must not trigger
+    // the Cmd+Alt+T theme-cycle binding.
+    {
+      name: "does not cycle theme on macOS when Cmd is missing (Alt+T alone)",
+      event: { key: "\u2020", code: "KeyT", altKey: true },
+      context: { isMac: true },
     },
   ];
 

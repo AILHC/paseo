@@ -1,6 +1,6 @@
 import type { z } from "zod";
 import type { Logger } from "pino";
-import type { ProviderDefinition } from "./provider-registry.js";
+import type { ProviderSnapshotManager } from "./provider-snapshot-manager.js";
 import type { AgentManager, ManagedAgent } from "./agent-manager.js";
 import type { AgentStorage, StoredAgentRecord } from "./agent-storage.js";
 import type {
@@ -18,9 +18,9 @@ import type {
   FetchRecentProviderSessionsRequestMessage,
   ImportAgentRequestMessageSchema,
   RecentProviderSessionDescriptorPayload,
-} from "../../shared/messages.js";
+} from "@getpaseo/protocol/messages";
 import type { WorkspaceGitService } from "../workspace-git-service.js";
-import { createPathEquivalenceMatcher } from "../../utils/path.js";
+import { createRealpathAwarePathMatcher } from "../../utils/path.js";
 
 type ImportAgentRequestMessage = z.infer<typeof ImportAgentRequestMessageSchema>;
 
@@ -49,7 +49,7 @@ export interface ListImportableProviderSessionsInput {
   request: FetchRecentProviderSessionsRequestMessage;
   agentManager: Pick<AgentManager, "listAgents" | "listImportablePersistedAgents">;
   agentStorage: Pick<AgentStorage, "list">;
-  providerRegistry: Record<string, Pick<ProviderDefinition, "label"> | undefined>;
+  providerSnapshotManager: Pick<ProviderSnapshotManager, "getProviderLabel">;
 }
 
 export interface ListImportableProviderSessionsResult {
@@ -99,7 +99,7 @@ export function normalizeImportAgentRequest(
 export async function listImportableProviderSessions(
   input: ListImportableProviderSessionsInput,
 ): Promise<ListImportableProviderSessionsResult> {
-  const { request, agentManager, agentStorage, providerRegistry } = input;
+  const { request, agentManager, agentStorage, providerSnapshotManager } = input;
   const limit = request.limit ?? 20;
   const sinceTimestamp = parseRecentProviderSessionsSince(request.since);
   const providerFilter = request.providers ? new Set(request.providers) : undefined;
@@ -112,7 +112,7 @@ export async function listImportableProviderSessions(
   });
   let filteredAlreadyImportedCount = 0;
   const candidates: PersistedAgentDescriptor[] = [];
-  const matchesRequestCwd = request.cwd ? createPathEquivalenceMatcher(request.cwd) : null;
+  const matchesRequestCwd = request.cwd ? createRealpathAwarePathMatcher(request.cwd) : null;
   for (const descriptor of descriptors) {
     if (matchesRequestCwd && !matchesRequestCwd(descriptor.cwd)) {
       continue;
@@ -121,6 +121,9 @@ export async function listImportableProviderSessions(
       continue;
     }
     if (isMetadataGenerationDescriptor(descriptor)) {
+      continue;
+    }
+    if (!hasUserPrompt(descriptor)) {
       continue;
     }
     const providerHandleId =
@@ -137,7 +140,7 @@ export async function listImportableProviderSessions(
     .slice(0, limit)
     .map((descriptor) =>
       toRecentProviderSessionDescriptorPayload(descriptor, {
-        providerLabel: providerRegistry[descriptor.provider]?.label ?? descriptor.provider,
+        providerLabel: providerSnapshotManager.getProviderLabel(descriptor.provider),
       }),
     );
 
@@ -325,6 +328,12 @@ function isMetadataGenerationDescriptor(descriptor: PersistedAgentDescriptor): b
     return item.text.trimStart().startsWith(METADATA_GENERATION_PROMPT_PREFIX);
   }
   return false;
+}
+
+function hasUserPrompt(descriptor: PersistedAgentDescriptor): boolean {
+  return descriptor.timeline.some(
+    (item) => item.type === "user_message" && item.text.trim() !== "",
+  );
 }
 
 function collectProviderSessionHandleKeys(

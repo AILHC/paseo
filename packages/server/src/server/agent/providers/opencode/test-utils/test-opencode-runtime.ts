@@ -8,7 +8,11 @@ interface OpenCodeResponse {
 }
 
 export class TestOpenCodeRuntime implements OpenCodeRuntime {
-  readonly acquisitions: Array<{ force: boolean; releaseCount: number }> = [];
+  readonly acquisitions: Array<{
+    force: boolean;
+    env?: Record<string, string>;
+    releaseCount: number;
+  }> = [];
   readonly clientCreations: Array<{ baseUrl: string; directory: string }> = [];
   private readonly clients: TestOpenCodeClient[] = [];
 
@@ -18,8 +22,11 @@ export class TestOpenCodeRuntime implements OpenCodeRuntime {
     this.clients.push(client);
   }
 
-  async acquireServer(options: { force: boolean }): Promise<OpenCodeServerAcquisition> {
-    const acquisition = { force: options.force, releaseCount: 0 };
+  async acquireServer(options: {
+    force: boolean;
+    env?: Record<string, string>;
+  }): Promise<OpenCodeServerAcquisition> {
+    const acquisition = { force: options.force, env: options.env, releaseCount: 0 };
     this.acquisitions.push(acquisition);
     return {
       server: this.server,
@@ -49,6 +56,8 @@ export class TestOpenCodeClient {
     eventSubscribe: [] as unknown[],
     experimentalSessionList: [] as unknown[],
     globalEvent: [] as unknown[],
+    mcpAdd: [] as unknown[],
+    mcpConnect: [] as unknown[],
     permissionReply: [] as unknown[],
     providerList: [] as unknown[],
     questionReject: [] as unknown[],
@@ -67,6 +76,8 @@ export class TestOpenCodeClient {
   commandListResponse: OpenCodeResponse = { data: [] };
   eventStream: AsyncIterable<unknown>;
   experimentalSessionListResponse: OpenCodeResponse = { data: [] };
+  mcpAddResponse: OpenCodeResponse = {};
+  mcpConnectResponse: OpenCodeResponse = {};
   permissionReplyResponse: OpenCodeResponse = {};
   providerListResponse: OpenCodeResponse = { data: { connected: [], all: [] } };
   providerListImplementation: (() => Promise<OpenCodeResponse>) | null = null;
@@ -128,8 +139,14 @@ export class TestOpenCodeClient {
         },
       },
       mcp: {
-        add: async () => ({}),
-        connect: async () => ({}),
+        add: async (parameters: unknown) => {
+          this.calls.mcpAdd.push(parameters);
+          return this.mcpAddResponse;
+        },
+        connect: async (parameters: unknown) => {
+          this.calls.mcpConnect.push(parameters);
+          return this.mcpConnectResponse;
+        },
       },
       permission: {
         reply: async (parameters: unknown) => {

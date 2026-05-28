@@ -1,7 +1,7 @@
 import { page } from "@vitest/browser/context";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { TerminalInputModeState } from "@server/shared/terminal-input-mode";
-import { TerminalEmulatorRuntime } from "./terminal-emulator-runtime";
+import type { TerminalInputModeState } from "@getpaseo/protocol/terminal-input-mode";
+import { encodeTerminalOutput, TerminalEmulatorRuntime } from "./terminal-emulator-runtime";
 
 vi.mock("@xterm/addon-webgl", () => ({
   WebglAddon: class WebglAddon {
@@ -47,6 +47,10 @@ function nextFrame(): Promise<void> {
       resolve();
     });
   });
+}
+
+function terminalOutput(text: string): Uint8Array {
+  return encodeTerminalOutput(text);
 }
 
 async function waitFor(input: { predicate: () => boolean; timeoutMs?: number }): Promise<void> {
@@ -253,7 +257,7 @@ describe("terminal emulator runtime in a real browser", () => {
 
     expect(mounted.terminalKeys).toEqual([]);
 
-    mounted.runtime.write({ text: "\x1b[>7u" });
+    mounted.runtime.write({ data: terminalOutput("\x1b[>7u") });
     await waitFor({
       predicate: () =>
         mounted.inputModeChanges.some(
@@ -279,7 +283,7 @@ describe("terminal emulator runtime in a real browser", () => {
     ]);
 
     mounted.terminalKeys.length = 0;
-    mounted.runtime.write({ text: "\x1b[=0;0u\x1b[?9001h" });
+    mounted.runtime.write({ data: terminalOutput("\x1b[=0;0u\x1b[?9001h") });
     await waitFor({
       predicate: () =>
         mounted.inputModeChanges.some(
@@ -315,13 +319,16 @@ describe("terminal emulator runtime in a real browser", () => {
     { name: "DSR-?6", bytes: "\x1b[?6n" },
     { name: "DECRQM", bytes: "\x1b[1$p" },
     { name: "DECRQM-?", bytes: "\x1b[?1$p" },
+    { name: "OSC-10-foreground-color", bytes: "\x1b]10;?\x07" },
+    { name: "OSC-11-background-color", bytes: "\x1b]11;?\x07" },
+    { name: "OSC-12-cursor-color", bytes: "\x1b]12;?\x07" },
   ])("does not emit a PTY input reply for $name", async ({ bytes }) => {
     await page.viewport(900, 600);
     const mounted = createTerminalHost({ width: 720, height: 360 });
 
     await waitFor({ predicate: () => mounted.sizes.length > 0 });
 
-    mounted.runtime.write({ text: bytes });
+    mounted.runtime.write({ data: terminalOutput(bytes) });
     await nextFrame();
     await nextFrame();
 

@@ -8,7 +8,7 @@ import {
   StructuredAgentResponseError,
   generateStructuredAgentResponseWithFallback,
 } from "./agent-response-loop.js";
-import { MAX_AUTO_AGENT_TITLE_CHARS } from "./agent-title-limits.js";
+import { MAX_AUTO_AGENT_TITLE_CHARS } from "@getpaseo/protocol/agent-title-limits";
 import { buildMetadataPrompt } from "../../utils/build-metadata-prompt.js";
 import type { WorkspaceGitService } from "../workspace-git-service.js";
 
@@ -132,25 +132,19 @@ export async function generateAndApplyAgentMetadata(
       maxRetries: 2,
       providers: DEFAULT_STRUCTURED_GENERATION_PROVIDERS,
       persistSession: false,
+      logger: options.logger,
       agentConfigOverrides: {
         title: "Agent metadata generator",
         internal: true,
       },
     });
   } catch (error) {
-    if (
-      error instanceof StructuredAgentResponseError ||
-      error instanceof StructuredAgentFallbackError
-    ) {
-      options.logger.warn(
-        { err: error, agentId: options.agentId },
-        "Structured metadata generation failed",
-      );
-      return;
-    }
+    const attempts = error instanceof StructuredAgentFallbackError ? error.attempts : undefined;
     options.logger.error(
-      { err: error, agentId: options.agentId },
-      "Agent metadata generation failed",
+      { err: error, agentId: options.agentId, attempts },
+      error instanceof StructuredAgentResponseError || error instanceof StructuredAgentFallbackError
+        ? "Structured metadata generation failed"
+        : "Agent metadata generation failed",
     );
     return;
   }
@@ -158,7 +152,7 @@ export async function generateAndApplyAgentMetadata(
   if (needs.needsTitle && typeof result.title === "string") {
     const normalizedTitle = normalizeAutoTitle(result.title);
     if (normalizedTitle) {
-      await options.agentManager.setTitle(options.agentId, normalizedTitle);
+      await options.agentManager.setGeneratedTitle(options.agentId, normalizedTitle);
     }
   }
 }

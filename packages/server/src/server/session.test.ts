@@ -2,23 +2,18 @@ import { execSync } from "child_process";
 import { EventEmitter } from "events";
 import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { homedir, tmpdir } from "os";
-import { join } from "path";
+import { join, resolve as resolvePath } from "path";
 import pino from "pino";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-import type { WorkspaceDescriptorPayload } from "../shared/messages.js";
-import { decodeFileTransferFrame, FileTransferOpcode } from "../shared/binary-frames/index.js";
+import type { WorkspaceDescriptorPayload } from "@getpaseo/protocol/messages";
+import {
+  decodeFileTransferFrame,
+  FileTransferOpcode,
+} from "@getpaseo/protocol/binary-frames/index";
 import { Session } from "./session.js";
 import { StructuredAgentFallbackError } from "./agent/agent-response-loop.js";
-import type {
-  AgentClient,
-  AgentMode,
-  AgentModelDefinition,
-  ListModesOptions,
-  ListModelsOptions,
-} from "./agent/agent-sdk-types.js";
-import type { ProviderDefinition } from "./agent/provider-registry.js";
-import { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
+import type { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import type { SessionOptions } from "./session.js";
 import type {
   SpeechToTextProvider,
@@ -80,7 +75,6 @@ interface SessionHandlerInternals {
   handleStashPopRequest(params: unknown): Promise<unknown>;
   createPaseoWorktree(params: unknown): Promise<unknown>;
   handleStartWorkspaceScriptRequest(params: unknown): Promise<unknown>;
-  getProviderRegistry(): unknown;
   sttManager: {
     transcribe(audio: Buffer, format: string): Promise<unknown>;
   };
@@ -112,6 +106,7 @@ const checkoutGitMocks = vi.hoisted(() => ({
   mergeToBase: vi.fn(),
   pullCurrentBranch: vi.fn(),
   pushCurrentBranch: vi.fn(),
+  renameCurrentBranch: vi.fn(),
   resolveBranchCheckout: vi.fn(),
   warmCheckoutShortstatInBackground: vi.fn(),
 }));
@@ -139,46 +134,6 @@ interface Deferred<T> {
   reject: (reason?: unknown) => void;
 }
 
-const TEST_CAPABILITIES = {
-  supportsStreaming: false,
-  supportsSessionPersistence: false,
-  supportsDynamicModes: false,
-  supportsMcpServers: false,
-  supportsReasoningStream: false,
-  supportsToolInvocations: false,
-} as const;
-
-function createTestProviderDefinition(overrides?: Partial<ProviderDefinition>): ProviderDefinition {
-  return {
-    id: "codex",
-    label: "Codex",
-    description: "Codex test provider",
-    enabled: true,
-    defaultModeId: null,
-    modes: [],
-    createClient: () =>
-      ({
-        provider: "codex",
-        capabilities: TEST_CAPABILITIES,
-        async createSession() {
-          throw new Error("not implemented");
-        },
-        async resumeSession() {
-          throw new Error("not implemented");
-        },
-        async listModels() {
-          return [];
-        },
-        async isAvailable() {
-          return true;
-        },
-      }) satisfies AgentClient,
-    fetchModels: async () => [],
-    fetchModes: async () => [],
-    ...overrides,
-  };
-}
-
 function deferred<T>(): Deferred<T> {
   let resolve!: (value: T) => void;
   let reject!: (reason?: unknown) => void;
@@ -203,6 +158,7 @@ vi.mock("../utils/checkout-git.js", async (importOriginal) => {
     mergeToBase: checkoutGitMocks.mergeToBase,
     pullCurrentBranch: checkoutGitMocks.pullCurrentBranch,
     pushCurrentBranch: checkoutGitMocks.pushCurrentBranch,
+    renameCurrentBranch: checkoutGitMocks.renameCurrentBranch,
     resolveBranchCheckout: checkoutGitMocks.resolveBranchCheckout,
     warmCheckoutShortstatInBackground: checkoutGitMocks.warmCheckoutShortstatInBackground,
   };
@@ -352,7 +308,8 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
     stt: options.stt ?? null,
     tts: null,
     terminalManager: options.terminalManager ?? null,
-    providerSnapshotManager: options.providerSnapshotManager,
+    providerSnapshotManager:
+      options.providerSnapshotManager ?? createProviderSnapshotManagerStub().manager,
     scriptRouteStore: options.scriptRouteStore,
     scriptRuntimeStore: options.scriptRuntimeStore,
     getDaemonTcpPort: options.getDaemonTcpPort,
@@ -927,6 +884,16 @@ function createWorkspaceGitSnapshot(
   };
 }
 
+function createTerminalManagerStub(options?: { setTerminalTitle?: ReturnType<typeof vi.fn> }): {
+  setTerminalTitle: ReturnType<typeof vi.fn>;
+  subscribeTerminalsChanged: ReturnType<typeof vi.fn>;
+} {
+  return {
+    setTerminalTitle: options?.setTerminalTitle ?? vi.fn(),
+    subscribeTerminalsChanged: vi.fn(() => () => {}),
+  };
+}
+
 afterEach(() => {
   vi.clearAllMocks();
 });
@@ -974,17 +941,36 @@ describe("session provider refresh cwd routing", () => {
     expect(refreshSettingsSnapshot).not.toHaveBeenCalled();
   });
 
+  test("get_providers_snapshot_request forwards cwd to the provider authority", async () => {
+    const messages: unknown[] = [];
+    const workspaceCwd = resolvePath("/tmp/session-provider-snapshot");
+    const { manager: providerSnapshotManager, getSnapshot } = createProviderSnapshotManagerStub();
+    const session = createSessionForTest({ messages, providerSnapshotManager });
+
+    await session.handleMessage({
+      type: "get_providers_snapshot_request",
+      cwd: workspaceCwd,
+      requestId: "snapshot-workspace",
+    });
+
+    expect(getSnapshot).toHaveBeenCalledWith(workspaceCwd);
+  });
+
   test("normalizes legacy model and mode list requests without cwd to home", async () => {
     const messages: unknown[] = [];
-    const session = createSessionForTest({ messages });
-    const fetchModels = vi.fn(async () => []);
-    const fetchModes = vi.fn(async () => []);
-    asSessionInternals(session).getProviderRegistry = () => ({
-      codex: createTestProviderDefinition({
-        fetchModels,
-        fetchModes,
-      }),
-    });
+    const {
+      manager: providerSnapshotManager,
+      getSnapshot,
+      warmUpSnapshotForCwd,
+    } = createProviderSnapshotManagerStub();
+    getSnapshot.mockReturnValue([
+      {
+        provider: "codex",
+        status: "loading",
+        enabled: true,
+      },
+    ]);
+    const session = createSessionForTest({ messages, providerSnapshotManager });
 
     await session.handleMessage({
       type: "list_provider_models_request",
@@ -997,8 +983,11 @@ describe("session provider refresh cwd routing", () => {
       requestId: "modes-home",
     });
 
-    expect(fetchModels).toHaveBeenCalledWith({ cwd: homedir(), force: false });
-    expect(fetchModes).toHaveBeenCalledWith({ cwd: homedir(), force: false });
+    expect(getSnapshot).toHaveBeenCalledWith(homedir());
+    expect(warmUpSnapshotForCwd).toHaveBeenCalledWith({
+      cwd: homedir(),
+      providers: ["codex"],
+    });
   });
 
   test("legacy model list request treats disabled snapshot entries as unavailable without warming", async () => {
@@ -1063,104 +1052,33 @@ describe("session provider refresh cwd routing", () => {
     });
   });
 
-  test("legacy model and mode list fallback treats disabled registry definitions as unavailable without fetching", async () => {
+  test("list_provider_models_request awaits warmup and emits ready models", async () => {
     const messages: unknown[] = [];
-    const session = createSessionForTest({ messages });
-    const fetchModels = vi.fn(async () => [
+    const warmupDeferred = deferred<void>();
+    const {
+      manager: providerSnapshotManager,
+      getSnapshot,
+      warmUpSnapshotForCwd,
+    } = createProviderSnapshotManagerStub();
+    getSnapshot.mockReturnValueOnce([
       {
-        provider: "codex" as const,
-        id: "should-not-fetch",
-        label: "Should not fetch",
+        provider: "codex",
+        status: "loading",
+        enabled: true,
       },
     ]);
-    const fetchModes = vi.fn(async () => [
+    getSnapshot.mockReturnValue([
       {
-        id: "should-not-fetch",
-        label: "Should not fetch",
+        provider: "codex",
+        status: "ready",
+        enabled: true,
+        models: [{ provider: "codex", id: "gpt-5.4", label: "GPT-5.4" }],
+        modes: [],
+        fetchedAt: "2026-05-28T00:00:00.000Z",
       },
     ]);
-    asSessionInternals(session).getProviderRegistry = () => ({
-      codex: createTestProviderDefinition({
-        enabled: false,
-        fetchModels,
-        fetchModes,
-      }),
-    });
-
-    await session.handleMessage({
-      type: "list_provider_models_request",
-      provider: "codex",
-      requestId: "fallback-models-disabled",
-    });
-    await session.handleMessage({
-      type: "list_provider_modes_request",
-      provider: "codex",
-      requestId: "fallback-modes-disabled",
-    });
-
-    expect(fetchModels).not.toHaveBeenCalled();
-    expect(fetchModes).not.toHaveBeenCalled();
-    expect(messages).toContainEqual({
-      type: "list_provider_models_response",
-      payload: {
-        provider: "codex",
-        error: "Provider codex is disabled",
-        fetchedAt: expect.any(String),
-        requestId: "fallback-models-disabled",
-      },
-    });
-    expect(messages).toContainEqual({
-      type: "list_provider_modes_response",
-      payload: {
-        provider: "codex",
-        error: "Provider codex is disabled",
-        fetchedAt: expect.any(String),
-        requestId: "fallback-modes-disabled",
-      },
-    });
-  });
-
-  test("legacy model list request without cwd awaits loading snapshot without forced discovery", async () => {
-    const messages: unknown[] = [];
-    const models = deferred<AgentModelDefinition[]>();
-    const fetchModels = vi.fn(
-      async (options: ListModelsOptions): Promise<AgentModelDefinition[]> => {
-        expect(options.cwd).toBe(homedir());
-        return models.promise;
-      },
-    );
-    const fetchModes = vi.fn(async (_options: ListModesOptions): Promise<AgentMode[]> => []);
-    const providerDefinition = createTestProviderDefinition({
-      createClient: () =>
-        ({
-          provider: "codex",
-          capabilities: TEST_CAPABILITIES,
-          async createSession() {
-            throw new Error("not implemented");
-          },
-          async resumeSession() {
-            throw new Error("not implemented");
-          },
-          async listModels(options: ListModelsOptions) {
-            return fetchModels(options);
-          },
-          async isAvailable() {
-            return true;
-          },
-        }) satisfies AgentClient,
-      fetchModels,
-      fetchModes,
-    });
-    const providerSnapshotManager = new ProviderSnapshotManager(
-      { codex: providerDefinition },
-      pino({ level: "silent" }),
-    );
+    warmUpSnapshotForCwd.mockReturnValue(warmupDeferred.promise);
     const session = createSessionForTest({ messages, providerSnapshotManager });
-
-    providerSnapshotManager.getSnapshot();
-    await vi.waitFor(() => {
-      expect(fetchModels).toHaveBeenCalledTimes(1);
-    });
 
     const responsePromise = session.handleMessage({
       type: "list_provider_models_request",
@@ -1168,23 +1086,13 @@ describe("session provider refresh cwd routing", () => {
       requestId: "models-loading-home",
     });
 
-    await Promise.resolve();
-
-    expect(fetchModels).toHaveBeenCalledTimes(1);
-    expect(fetchModels).toHaveBeenCalledWith({ cwd: homedir(), force: false });
-    expect(fetchModels).not.toHaveBeenCalledWith({ cwd: homedir(), force: true });
-
-    models.resolve([
-      {
-        provider: "codex",
-        id: "gpt-5.4",
-        label: "GPT-5.4",
-      },
-    ]);
+    expect(warmUpSnapshotForCwd).toHaveBeenCalledWith({
+      cwd: homedir(),
+      providers: ["codex"],
+    });
+    warmupDeferred.resolve();
     await responsePromise;
 
-    expect(fetchModels).toHaveBeenCalledTimes(1);
-    expect(fetchModels).not.toHaveBeenCalledWith({ cwd: homedir(), force: true });
     expect(messages).toContainEqual({
       type: "list_provider_models_response",
       payload: {
@@ -1197,12 +1105,10 @@ describe("session provider refresh cwd routing", () => {
           },
         ],
         error: null,
-        fetchedAt: expect.any(String),
+        fetchedAt: "2026-05-28T00:00:00.000Z",
         requestId: "models-loading-home",
       },
     });
-
-    providerSnapshotManager.destroy();
   });
 });
 
@@ -3153,6 +3059,208 @@ describe("session checkout switch branch handling", () => {
         source: "local",
         error: null,
         requestId: "request-switch",
+      },
+    });
+  });
+});
+
+describe("session checkout rename branch handling", () => {
+  test("rejects invalid branch slugs without renaming", async () => {
+    const messages: unknown[] = [];
+    const workspaceGitService = {
+      getSnapshot: vi.fn(),
+      peekSnapshot: vi.fn(),
+    };
+    const session = createSessionForTest({ workspaceGitService, messages });
+
+    await session.handleMessage({
+      type: "checkout.rename_branch.request",
+      cwd: "/tmp/repo",
+      branch: "Feature Name",
+      requestId: "request-rename-invalid",
+    });
+
+    expect(checkoutGitMocks.renameCurrentBranch).not.toHaveBeenCalled();
+    expect(workspaceGitService.getSnapshot).not.toHaveBeenCalled();
+    expect(messages).toContainEqual({
+      type: "checkout.rename_branch.response",
+      payload: {
+        cwd: "/tmp/repo",
+        success: false,
+        currentBranch: null,
+        error: {
+          code: "UNKNOWN",
+          message:
+            "Branch name must contain only lowercase letters, numbers, hyphens, and forward slashes",
+        },
+        requestId: "request-rename-invalid",
+      },
+    });
+  });
+
+  test("reports null current branch when branch rename fails", async () => {
+    const messages: unknown[] = [];
+    const workspaceGitService = {
+      getSnapshot: vi.fn(),
+      peekSnapshot: vi.fn(),
+    };
+    const session = createSessionForTest({ workspaceGitService, messages });
+    checkoutGitMocks.renameCurrentBranch.mockRejectedValue(new Error("branch already exists"));
+
+    await session.handleMessage({
+      type: "checkout.rename_branch.request",
+      cwd: "/tmp/repo",
+      branch: "feature/new-name",
+      requestId: "request-rename-failure",
+    });
+
+    expect(checkoutGitMocks.renameCurrentBranch).toHaveBeenCalledWith(
+      "/tmp/repo",
+      "feature/new-name",
+    );
+    expect(workspaceGitService.peekSnapshot).not.toHaveBeenCalled();
+    expect(workspaceGitService.getSnapshot).not.toHaveBeenCalled();
+    expect(messages).toContainEqual({
+      type: "checkout.rename_branch.response",
+      payload: {
+        cwd: "/tmp/repo",
+        success: false,
+        currentBranch: null,
+        error: {
+          code: "UNKNOWN",
+          message: "branch already exists",
+        },
+        requestId: "request-rename-failure",
+      },
+    });
+  });
+
+  test("forces workspace git refresh after renaming the current branch", async () => {
+    const messages: unknown[] = [];
+    const github = { invalidate: vi.fn() };
+    const workspaceGitService = {
+      getSnapshot: vi.fn().mockResolvedValue(
+        createWorkspaceGitSnapshot("/tmp/repo", {
+          git: {
+            currentBranch: "feature/new-name",
+            isDirty: false,
+          },
+        }),
+      ),
+      peekSnapshot: vi.fn(() =>
+        createWorkspaceGitSnapshot("/tmp/repo", {
+          git: { currentBranch: "feature/old-name" },
+        }),
+      ),
+    };
+    const session = createSessionForTest({ github, workspaceGitService, messages });
+    checkoutGitMocks.renameCurrentBranch.mockResolvedValue({
+      previousBranch: "feature/old-name",
+      currentBranch: "feature/new-name",
+    });
+
+    await session.handleMessage({
+      type: "checkout.rename_branch.request",
+      cwd: "/tmp/repo",
+      branch: "feature/new-name",
+      requestId: "request-rename-success",
+    });
+
+    expect(checkoutGitMocks.renameCurrentBranch).toHaveBeenCalledWith(
+      "/tmp/repo",
+      "feature/new-name",
+    );
+    expect(workspaceGitService.getSnapshot).toHaveBeenCalledWith("/tmp/repo", {
+      force: true,
+      reason: "rename-branch",
+    });
+    expect(github.invalidate).toHaveBeenCalledWith({ cwd: "/tmp/repo" });
+    expect(messages).toContainEqual({
+      type: "checkout.rename_branch.response",
+      payload: {
+        cwd: "/tmp/repo",
+        success: true,
+        currentBranch: "feature/new-name",
+        error: null,
+        requestId: "request-rename-success",
+      },
+    });
+  });
+});
+
+describe("session terminal rename handling", () => {
+  test("rejects an empty terminal title without calling the terminal manager", async () => {
+    const messages: unknown[] = [];
+    const terminalManager = createTerminalManagerStub();
+    const session = createSessionForTest({ terminalManager, messages });
+
+    await session.handleMessage({
+      type: "terminal.rename.request",
+      terminalId: "terminal-1",
+      title: "   ",
+      requestId: "request-empty-title",
+    });
+
+    expect(terminalManager.setTerminalTitle).not.toHaveBeenCalled();
+    expect(messages).toContainEqual({
+      type: "terminal.rename.response",
+      payload: {
+        requestId: "request-empty-title",
+        success: false,
+        error: "Title is required",
+      },
+    });
+  });
+
+  test("reports when the terminal manager cannot find the terminal", async () => {
+    const messages: unknown[] = [];
+    const terminalManager = createTerminalManagerStub({
+      setTerminalTitle: vi.fn(() => false),
+    });
+    const session = createSessionForTest({ terminalManager, messages });
+
+    await session.handleMessage({
+      type: "terminal.rename.request",
+      terminalId: "missing-terminal",
+      title: "Renamed terminal",
+      requestId: "request-missing-terminal",
+    });
+
+    expect(terminalManager.setTerminalTitle).toHaveBeenCalledWith(
+      "missing-terminal",
+      "Renamed terminal",
+    );
+    expect(messages).toContainEqual({
+      type: "terminal.rename.response",
+      payload: {
+        requestId: "request-missing-terminal",
+        success: false,
+        error: "Terminal not found",
+      },
+    });
+  });
+
+  test("trims and sets a valid terminal title", async () => {
+    const messages: unknown[] = [];
+    const terminalManager = createTerminalManagerStub({
+      setTerminalTitle: vi.fn(() => true),
+    });
+    const session = createSessionForTest({ terminalManager, messages });
+
+    await session.handleMessage({
+      type: "terminal.rename.request",
+      terminalId: "terminal-1",
+      title: "  Renamed terminal  ",
+      requestId: "request-title-success",
+    });
+
+    expect(terminalManager.setTerminalTitle).toHaveBeenCalledWith("terminal-1", "Renamed terminal");
+    expect(messages).toContainEqual({
+      type: "terminal.rename.response",
+      payload: {
+        requestId: "request-title-success",
+        success: true,
+        error: null,
       },
     });
   });

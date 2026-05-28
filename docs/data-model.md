@@ -139,6 +139,7 @@ Single file, validated with `PersistedConfigSchema`.
     listen: "127.0.0.1:6767",
     hostnames: true | string[],   // legacy alias `allowedHosts` is migrated on load
     mcp: { enabled: boolean, injectIntoAgents: boolean },
+    appendSystemPrompt: string,    // appended to supported provider system/developer prompts
     cors: { allowedOrigins: string[] },
     relay: { enabled: boolean, endpoint: string, publicEndpoint: string, useTls: boolean, publicUseTls: boolean },
     auth: { password: string }    // bcrypt hash, optional
@@ -169,6 +170,8 @@ Single file, validated with `PersistedConfigSchema`.
 ```
 
 All fields are optional with sensible defaults.
+
+Local speech model ids are intentionally narrow: STT uses `parakeet-tdt-0.6b-v2-int8`, TTS uses `kokoro-en-v0_19`, and turn detection uses the bundled Silero VAD model.
 
 ---
 
