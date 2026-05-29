@@ -202,6 +202,7 @@ import {
 import { validateBranchSlug } from "@getpaseo/protocol/branch-slug";
 import { getProjectIcon } from "../utils/project-icon.js";
 import { expandTilde } from "../utils/path.js";
+import { withTimeout } from "../utils/promise-timeout.js";
 import { searchHomeDirectories, searchWorkspaceEntries } from "../utils/directory-suggestions.js";
 import { toCheckoutError } from "./checkout-git-utils.js";
 import { CheckoutDiffManager } from "./checkout-diff-manager.js";
@@ -6057,7 +6058,11 @@ export class Session {
     const sort = this.agentsPager.normalizeSort(request.sort);
 
     try {
-      await this.agentManager.syncNativeArchivedStateForStoredAgents();
+      await withTimeout(
+        this.agentManager.syncNativeArchivedStateForStoredAgents(),
+        2000,
+        "Timed out syncing native archived agent state",
+      );
     } catch (error) {
       this.sessionLogger.warn({ err: error }, "Failed to sync native archived agent state");
     }
