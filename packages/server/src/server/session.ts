@@ -799,6 +799,8 @@ export class Session {
   private readonly getDaemonTcpHost: (() => string | null) | null;
   private readonly resolveScriptHealth: ((hostname: string) => ScriptHealthState | null) | null;
   private readonly terminalController: TerminalSessionController;
+  private nativeArchivedStateSyncInFlight: Promise<void> | null = null;
+  private nativeArchivedStateSyncLastStartedAt = 0;
   private inflightRequests = 0;
   private peakInflightRequests = 0;
   private readonly availableEditorTargetsCache = new TTLCache<
@@ -6045,6 +6047,29 @@ export class Session {
     return matchedEntries;
   }
 
+  private scheduleNativeArchivedStateSync(): void {
+    const now = Date.now();
+    if (
+      this.nativeArchivedStateSyncInFlight ||
+      now - this.nativeArchivedStateSyncLastStartedAt < 30_000
+    ) {
+      return;
+    }
+
+    this.nativeArchivedStateSyncLastStartedAt = now;
+    this.nativeArchivedStateSyncInFlight = withTimeout(
+      Promise.resolve().then(() => this.agentManager.syncNativeArchivedStateForStoredAgents()),
+      2000,
+      "Timed out syncing native archived agent state",
+    )
+      .catch((error) => {
+        this.sessionLogger.warn({ err: error }, "Failed to sync native archived agent state");
+      })
+      .finally(() => {
+        this.nativeArchivedStateSyncInFlight = null;
+      });
+  }
+
   private async listFetchAgentsEntries(request: AgentDirectoryRequestMessage): Promise<{
     entries: FetchAgentsResponseEntry[];
     pageInfo: FetchAgentsResponsePageInfo;
@@ -6057,15 +6082,7 @@ export class Session {
     const scope = request.type === "fetch_agents_request" ? request.scope : undefined;
     const sort = this.agentsPager.normalizeSort(request.sort);
 
-    try {
-      await withTimeout(
-        this.agentManager.syncNativeArchivedStateForStoredAgents(),
-        2000,
-        "Timed out syncing native archived agent state",
-      );
-    } catch (error) {
-      this.sessionLogger.warn({ err: error }, "Failed to sync native archived agent state");
-    }
+    this.scheduleNativeArchivedStateSync();
 
     let agents = await this.listAgentPayloads({
       labels: filter?.labels,

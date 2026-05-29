@@ -1787,7 +1787,7 @@ test("legacy unscoped fetch_agents keeps global workspace behavior", async () =>
   ]);
 });
 
-test("fetch_agents_request hides records after syncing native archived state", async () => {
+test("fetch_agents_request schedules native archived sync without delaying the list", async () => {
   const session = createSessionForWorkspaceTests();
   const root = path.resolve("/tmp/native-sync");
   const project = createPersistedProjectRecord({
@@ -1807,10 +1807,13 @@ test("fetch_agents_request hides records after syncing native archived state", a
     createdAt: "2026-03-01T12:00:00.000Z",
     updatedAt: "2026-03-01T12:00:00.000Z",
   });
-  let archivedAt: string | null = null;
-  const syncNativeArchivedStateForStoredAgents = vi.fn(async () => {
-    archivedAt = "2026-03-02T12:00:00.000Z";
-  });
+  let resolveSync: (() => void) | null = null;
+  const syncNativeArchivedStateForStoredAgents = vi.fn(
+    () =>
+      new Promise<void>((resolve) => {
+        resolveSync = resolve;
+      }),
+  );
 
   session.agentManager.syncNativeArchivedStateForStoredAgents =
     syncNativeArchivedStateForStoredAgents;
@@ -1830,7 +1833,7 @@ test("fetch_agents_request hides records after syncing native archived state", a
         status: "idle",
         updatedAt: "2026-03-01T12:00:00.000Z",
       }),
-      archivedAt,
+      archivedAt: null,
     },
   ];
 
@@ -1840,66 +1843,69 @@ test("fetch_agents_request hides records after syncing native archived state", a
   });
 
   expect(syncNativeArchivedStateForStoredAgents).toHaveBeenCalledTimes(1);
-  expect(agentIdsFromEntries(result.entries)).toEqual(["active-agent"]);
+  expect(agentIdsFromEntries(result.entries)).toEqual(["active-agent", "native-archived-agent"]);
+
+  resolveSync?.();
 });
 
-test("fetch_agents_request does not block when syncing native archived state stalls", async () => {
-  vi.useFakeTimers();
-  try {
-    const session = createSessionForWorkspaceTests();
-    const root = path.resolve("/tmp/native-sync-timeout");
-    const project = createPersistedProjectRecord({
-      projectId: "proj-native-sync-timeout",
-      rootPath: root,
-      kind: "non_git",
-      displayName: "native sync timeout",
-      createdAt: "2026-03-01T12:00:00.000Z",
-      updatedAt: "2026-03-01T12:00:00.000Z",
-    });
-    const workspace = createPersistedWorkspaceRecord({
-      workspaceId: "ws-native-sync-timeout",
-      projectId: project.projectId,
-      cwd: root,
-      kind: "directory",
-      displayName: "native sync timeout",
-      createdAt: "2026-03-01T12:00:00.000Z",
-      updatedAt: "2026-03-01T12:00:00.000Z",
-    });
-    const syncNativeArchivedStateForStoredAgents = vi.fn(() => new Promise<void>(() => undefined));
-
-    session.agentManager.syncNativeArchivedStateForStoredAgents =
-      syncNativeArchivedStateForStoredAgents;
-    session.projectRegistry.get = async () => project;
-    session.workspaceRegistry.list = async () => [workspace];
-    session.listAgentPayloads = async () => [
-      makeAgent({
-        id: "active-agent",
-        cwd: root,
-        status: "idle",
-        updatedAt: "2026-03-01T12:01:00.000Z",
+test("fetch_agents_request returns immediately when native archived sync stalls", async () => {
+  const session = createSessionForWorkspaceTests();
+  const root = path.resolve("/tmp/native-sync-timeout");
+  const project = createPersistedProjectRecord({
+    projectId: "proj-native-sync-timeout",
+    rootPath: root,
+    kind: "non_git",
+    displayName: "native sync timeout",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: "ws-native-sync-timeout",
+    projectId: project.projectId,
+    cwd: root,
+    kind: "directory",
+    displayName: "native sync timeout",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  let resolveSync: (() => void) | null = null;
+  const syncNativeArchivedStateForStoredAgents = vi.fn(
+    () =>
+      new Promise<void>((resolve) => {
+        resolveSync = resolve;
       }),
-    ];
+  );
 
-    const resultPromise = session.listFetchAgentsEntries({
-      type: "fetch_agents_request",
-      requestId: "req-native-sync-timeout",
-    });
-    let resolved = false;
-    resultPromise.then(() => {
-      resolved = true;
-      return undefined;
-    });
+  session.agentManager.syncNativeArchivedStateForStoredAgents =
+    syncNativeArchivedStateForStoredAgents;
+  session.projectRegistry.get = async () => project;
+  session.workspaceRegistry.list = async () => [workspace];
+  session.listAgentPayloads = async () => [
+    makeAgent({
+      id: "active-agent",
+      cwd: root,
+      status: "idle",
+      updatedAt: "2026-03-01T12:01:00.000Z",
+    }),
+  ];
 
-    await vi.advanceTimersByTimeAsync(2500);
-    await Promise.resolve();
+  const resultPromise = session.listFetchAgentsEntries({
+    type: "fetch_agents_request",
+    requestId: "req-native-sync-timeout",
+  });
 
-    expect(syncNativeArchivedStateForStoredAgents).toHaveBeenCalledTimes(1);
-    expect(resolved).toBe(true);
-    const result = await resultPromise;
-    expect(agentIdsFromEntries(result.entries)).toEqual(["active-agent"]);
-  } finally {
-    vi.useRealTimers();
-  }
+  const result = await Promise.race([
+    resultPromise,
+    new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 50)),
+  ]);
+
+  expect(syncNativeArchivedStateForStoredAgents).toHaveBeenCalledTimes(1);
+  expect(result).not.toBe("timeout");
+  expect(agentIdsFromEntries((result as Awaited<typeof resultPromise>).entries)).toEqual([
+    "active-agent",
+  ]);
+
+  resolveSync?.();
 });
 
 test("fetch_agent_history_request pages archived historical rows separately", async () => {
