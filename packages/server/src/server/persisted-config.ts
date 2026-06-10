@@ -8,7 +8,7 @@ import {
   ProviderOverridesSchema,
 } from "./agent/provider-launch-config.js";
 import type { AgentProviderRuntimeSettingsMap } from "./agent/provider-launch-config.js";
-import { ensurePrivateFile, writePrivateFileSync } from "./private-files.js";
+import { ensurePrivateFile, writePrivateFileAtomicSync } from "./private-files.js";
 
 export const LogLevelSchema = z.enum(["trace", "debug", "info", "warn", "error", "fatal"]);
 export const LogFormatSchema = z.enum(["pretty", "json"]);
@@ -60,6 +60,12 @@ const ProvidersSchema = z
   .object({
     openai: ProviderCredentialsSchema.optional(),
     local: LocalSpeechProviderSchema.optional(),
+  })
+  .strict();
+
+const WorktreesConfigSchema = z
+  .object({
+    root: z.string().min(1).optional(),
   })
   .strict();
 
@@ -131,7 +137,21 @@ const FeatureVoiceModeSchema = z
   })
   .strict();
 
-const BUILTIN_PROVIDER_IDS = ["claude", "codex", "copilot", "opencode", "pi"] as const;
+const StructuredGenerationProviderConfigSchema = z
+  .object({
+    provider: z.string().min(1),
+    model: z.string().min(1).optional(),
+    thinkingOptionId: z.string().min(1).optional(),
+  })
+  .strict();
+
+const AgentMetadataGenerationSchema = z
+  .object({
+    providers: z.array(StructuredGenerationProviderConfigSchema).optional(),
+  })
+  .strict();
+
+const BUILTIN_PROVIDER_IDS = ["claude", "codex", "copilot", "opencode", "pi", "omp"] as const;
 
 function isLegacyProviderEntry(value: unknown): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -183,6 +203,8 @@ function normalizeAgentProviders(value: unknown): unknown {
 
 export const PersistedConfigSchema = z
   .object({
+    $schema: z.string().optional(),
+
     // v1 schema marker
     version: z.literal(1).optional(),
 
@@ -217,6 +239,17 @@ export const PersistedConfigSchema = z
           })
           .strict()
           .optional(),
+        serviceProxy: z
+          .object({
+            // COMPAT(serviceProxyEnabled): added 2026-06-02, remove after 2026-12-02.
+            // Parsed only to suppress optional public/listen layers for old configs;
+            // localhost service proxying remains always enabled.
+            enabled: z.boolean().optional(),
+            listen: z.string().optional(),
+            publicBaseUrl: z.string().url().optional(),
+          })
+          .strict()
+          .optional(),
         auth: DaemonAuthSchema.optional(),
       })
       .strict()
@@ -234,9 +267,11 @@ export const PersistedConfigSchema = z
       .optional(),
 
     providers: ProvidersSchema.optional(),
+    worktrees: WorktreesConfigSchema.optional(),
     agents: z
       .object({
         providers: z.preprocess(normalizeAgentProviders, ProviderOverridesSchema).optional(),
+        metadataGeneration: AgentMetadataGenerationSchema.optional(),
       })
       .strict()
       .optional(),
@@ -324,7 +359,10 @@ export function loadPersistedConfig(paseoHome: string, logger?: LoggerLike): Per
 
   if (!existsSync(configPath)) {
     try {
-      writePrivateFileSync(configPath, JSON.stringify(DEFAULT_PERSISTED_CONFIG, null, 2) + "\n");
+      writePrivateFileAtomicSync(
+        configPath,
+        JSON.stringify(DEFAULT_PERSISTED_CONFIG, null, 2) + "\n",
+      );
       log?.info(`Initialized config file at ${configPath}`);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -383,7 +421,7 @@ export function savePersistedConfig(
   }
 
   try {
-    writePrivateFileSync(configPath, JSON.stringify(result.data, null, 2) + "\n");
+    writePrivateFileAtomicSync(configPath, JSON.stringify(result.data, null, 2) + "\n");
     log?.info(`Saved to ${configPath}`);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

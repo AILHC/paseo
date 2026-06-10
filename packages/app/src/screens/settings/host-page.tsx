@@ -7,7 +7,10 @@ import { AdaptiveRenameModal } from "@/components/rename-modal";
 import { SettingsTextAreaCard } from "@/components/settings-textarea";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
+import { startDesktopDaemon, stopDesktopDaemon } from "@/desktop/daemon/desktop-daemon";
 import { LocalDaemonSection } from "@/desktop/components/desktop-updates-section";
+import { useDaemonStatus } from "@/desktop/hooks/use-daemon-status";
+import { useDesktopSettings } from "@/desktop/settings/desktop-settings";
 import { PairDeviceModal } from "@/desktop/components/pair-device-modal";
 import { useDaemonConfig } from "@/hooks/use-daemon-config";
 import { useIsLocalDaemon } from "@/hooks/use-is-local-daemon";
@@ -72,27 +75,31 @@ function formatDaemonVersionBadge(version: string | null): string | null {
 }
 
 const REMOVE_CONNECTION_HEADER: SheetHeader = { title: "Remove connection" };
-const REMOVE_HOST_HEADER: SheetHeader = { title: "Remove host" };
 
-export interface HostPageProps {
-  serverId: string;
-  onHostRemoved?: () => void;
+function useHostProfile(serverId: string): HostProfile | null {
+  const daemons = useHosts();
+  return daemons.find((entry) => entry.serverId === serverId) ?? null;
 }
 
-export function HostPage({ serverId, onHostRemoved }: HostPageProps) {
-  const daemons = useHosts();
-  const host = daemons.find((entry) => entry.serverId === serverId) ?? null;
+function HostNotFound() {
+  return (
+    <View>
+      <View style={EMPTY_CARD_STYLE}>
+        <Text style={styles.emptyText}>Host not found</Text>
+      </View>
+    </View>
+  );
+}
+
+function HostStatusBadges({ serverId }: { serverId: string }) {
   const { theme } = useUnistyles();
   const snapshot = useHostRuntimeSnapshot(serverId);
-  const isLocalDaemon = useIsLocalDaemon(serverId);
-
   const daemonVersion = useSessionStore(
     (state) => state.sessions[serverId]?.serverInfo?.version ?? null,
   );
 
   const connectionStatus = snapshot?.connectionStatus ?? "connecting";
   const activeConnection = snapshot?.activeConnection ?? null;
-  const lastError = snapshot?.lastError ?? null;
   const statusLabel = formatConnectionStatus(connectionStatus);
   const statusTone = getConnectionStatusTone(connectionStatus);
   let statusColor: string;
@@ -117,8 +124,6 @@ export function HostPage({ serverId, onHostRemoved }: HostPageProps) {
   }
   const connectionBadge = formatActiveConnectionBadge(activeConnection, theme);
   const versionBadgeText = formatDaemonVersionBadge(daemonVersion);
-  const connectionError =
-    typeof lastError === "string" && lastError.trim().length > 0 ? lastError.trim() : null;
 
   const statusPillStyle = useMemo(
     () => [styles.statusPill, { backgroundColor: statusPillBg }],
@@ -130,48 +135,150 @@ export function HostPage({ serverId, onHostRemoved }: HostPageProps) {
   );
   const statusTextStyle = useMemo(() => [styles.statusText, { color: statusColor }], [statusColor]);
 
-  if (!host) {
-    return (
-      <View testID={`settings-host-page-${serverId}`}>
-        <View style={EMPTY_CARD_STYLE}>
-          <Text style={styles.emptyText}>Host not found</Text>
-        </View>
+  return (
+    <View style={styles.identityBadges} testID="host-page-identity">
+      <View style={statusPillStyle}>
+        <View style={statusDotStyle} />
+        <Text style={statusTextStyle}>{statusLabel}</Text>
       </View>
-    );
+      {connectionBadge ? (
+        <View style={styles.badgePill}>
+          {connectionBadge.icon}
+          <Text style={styles.badgeText} numberOfLines={1}>
+            {connectionBadge.text}
+          </Text>
+        </View>
+      ) : null}
+      {versionBadgeText ? (
+        <View style={styles.badgePill}>
+          <Text style={styles.badgeText} numberOfLines={1}>
+            {versionBadgeText}
+          </Text>
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
+function HostConnectionError({ serverId }: { serverId: string }) {
+  const snapshot = useHostRuntimeSnapshot(serverId);
+  const lastError = snapshot?.lastError ?? null;
+  const connectionError =
+    typeof lastError === "string" && lastError.trim().length > 0 ? lastError.trim() : null;
+  if (!connectionError) return null;
+  return <Text style={styles.errorText}>{connectionError}</Text>;
+}
+
+export function HostConnectionsPage({ serverId }: { serverId: string }) {
+  const host = useHostProfile(serverId);
+  const isLocalDaemon = useIsLocalDaemon(serverId);
+
+  if (!host) {
+    return <HostNotFound />;
   }
 
   return (
-    <View testID={`settings-host-page-${serverId}`}>
-      <View style={styles.identityBadges} testID="host-page-identity">
-        <View style={statusPillStyle}>
-          <View style={statusDotStyle} />
-          <Text style={statusTextStyle}>{statusLabel}</Text>
-        </View>
-        {connectionBadge ? (
-          <View style={styles.badgePill}>
-            {connectionBadge.icon}
-            <Text style={styles.badgeText} numberOfLines={1}>
-              {connectionBadge.text}
-            </Text>
-          </View>
-        ) : null}
-        {versionBadgeText ? (
-          <View style={styles.badgePill}>
-            <Text style={styles.badgeText} numberOfLines={1}>
-              {versionBadgeText}
-            </Text>
-          </View>
-        ) : null}
-      </View>
-      {connectionError ? <Text style={styles.errorText}>{connectionError}</Text> : null}
-
+    <View>
+      <HostConnectionError serverId={serverId} />
       <ConnectionsSection host={host} />
+      {isLocalDaemon ? (
+        <SettingsSection title="Pair devices">
+          <PairDeviceRow />
+        </SettingsSection>
+      ) : null}
+    </View>
+  );
+}
 
-      <DaemonSection host={host} isLocalDaemon={isLocalDaemon} />
+export function HostAgentsPage({ serverId }: { serverId: string }) {
+  const host = useHostProfile(serverId);
+  const isConnected = useHostRuntimeIsConnected(serverId);
 
+  if (!host) {
+    return <HostNotFound />;
+  }
+
+  return (
+    <View>
+      {isConnected ? (
+        <SettingsSection title="Agents">
+          <InjectPaseoToolsCard serverId={serverId} />
+          <AppendSystemPromptCard serverId={serverId} />
+        </SettingsSection>
+      ) : (
+        <View style={EMPTY_CARD_STYLE}>
+          <Text style={styles.emptyText}>Connect to this host to manage agents</Text>
+        </View>
+      )}
+    </View>
+  );
+}
+
+export function HostWorkspacesPage({ serverId }: { serverId: string }) {
+  const host = useHostProfile(serverId);
+  const isConnected = useHostRuntimeIsConnected(serverId);
+
+  if (!host) {
+    return <HostNotFound />;
+  }
+
+  return (
+    <View>
+      {isConnected ? (
+        <SettingsSection title="Workspaces">
+          <AutoArchiveMergedWorkspacesCard serverId={serverId} />
+        </SettingsSection>
+      ) : (
+        <View style={EMPTY_CARD_STYLE}>
+          <Text style={styles.emptyText}>Connect to this host to manage workspaces</Text>
+        </View>
+      )}
+    </View>
+  );
+}
+
+export function HostProvidersPage({ serverId }: { serverId: string }) {
+  const host = useHostProfile(serverId);
+
+  if (!host) {
+    return <HostNotFound />;
+  }
+
+  return (
+    <View>
       <ProvidersSection serverId={serverId} />
+    </View>
+  );
+}
 
-      <RemoveHostSection host={host} onRemoved={onHostRemoved} />
+export function HostSettingsPage({
+  serverId,
+  onHostRemoved,
+}: {
+  serverId: string;
+  onHostRemoved?: () => void;
+}) {
+  const host = useHostProfile(serverId);
+  const isLocalDaemon = useIsLocalDaemon(serverId);
+
+  if (!host) {
+    return <HostNotFound />;
+  }
+
+  return (
+    <View>
+      <View style={styles.daemonHeader}>
+        <Text style={styles.daemonHeaderLabel} numberOfLines={1}>
+          {host.label}
+        </Text>
+        <HostRenameButton host={host} />
+      </View>
+
+      <HostStatusBadges serverId={serverId} />
+
+      {isLocalDaemon ? <LocalDaemonSection /> : null}
+
+      <RemoveHostSection host={host} isLocalDaemon={isLocalDaemon} onRemoved={onHostRemoved} />
     </View>
   );
 }
@@ -337,7 +444,7 @@ function ConnectionRow({
     if (latencyLoading) return "...";
     if (latencyError) return "Timeout";
     if (latencyMs != null) return formatLatency(latencyMs);
-    return "\u2014";
+    return "—";
   })();
   const latencyColor = latencyError ? theme.colors.palette.red[300] : theme.colors.foregroundMuted;
 
@@ -375,23 +482,6 @@ function ConnectionRow({
         Remove
       </Button>
     </View>
-  );
-}
-
-function DaemonSection({ host, isLocalDaemon }: { host: HostProfile; isLocalDaemon: boolean }) {
-  return (
-    <>
-      <SettingsSection title="Daemon settings">
-        <InjectPaseoToolsCard serverId={host.serverId} />
-        <AppendSystemPromptCard serverId={host.serverId} />
-      </SettingsSection>
-      {isLocalDaemon ? (
-        <SettingsSection title="Pair devices">
-          <PairDeviceRow />
-        </SettingsSection>
-      ) : null}
-      {isLocalDaemon ? <LocalDaemonSection /> : null}
-    </>
   );
 }
 
@@ -561,6 +651,45 @@ function InjectPaseoToolsCard({ serverId }: { serverId: string }) {
   );
 }
 
+function AutoArchiveMergedWorkspacesCard({ serverId }: { serverId: string }) {
+  const isConnected = useHostRuntimeIsConnected(serverId);
+  const { config, patchConfig } = useDaemonConfig(serverId);
+
+  const handleValueChange = useCallback(
+    (next: boolean) => {
+      void patchConfig({ autoArchiveAfterMerge: next }).catch((error) => {
+        console.error("[HostPage] Failed to update auto-archive after merge", error);
+        Alert.alert(
+          "Unable to update workspaces",
+          error instanceof Error ? error.message : String(error),
+        );
+      });
+    },
+    [patchConfig],
+  );
+
+  if (!isConnected) return null;
+
+  return (
+    <View style={settingsStyles.card} testID="host-page-auto-archive-merged-workspaces-card">
+      <View style={settingsStyles.row}>
+        <View style={settingsStyles.rowContent}>
+          <Text style={settingsStyles.rowTitle}>Archive merged PR workspaces</Text>
+          <Text style={settingsStyles.rowHint}>
+            Automatically archive clean Paseo workspaces after their pull request is merged
+          </Text>
+        </View>
+        <Switch
+          value={config?.autoArchiveAfterMerge === true}
+          onValueChange={handleValueChange}
+          accessibilityLabel="Archive merged PR workspaces"
+          testID="host-page-auto-archive-merged-workspaces-switch"
+        />
+      </View>
+    </View>
+  );
+}
+
 function AppendSystemPromptCard({ serverId }: { serverId: string }) {
   const isConnected = useHostRuntimeIsConnected(serverId);
   const { config, patchConfig } = useDaemonConfig(serverId);
@@ -612,7 +741,7 @@ function AppendSystemPromptCard({ serverId }: { serverId: string }) {
         <View style={settingsStyles.row}>
           <View style={settingsStyles.rowContent}>
             <Text style={settingsStyles.rowTitle}>System prompt</Text>
-            <Text style={settingsStyles.rowHint}>Added a system prompt to all agents</Text>
+            <Text style={settingsStyles.rowHint}>Adds a system prompt to all agents</Text>
           </View>
           <Button
             variant="outline"
@@ -699,11 +828,22 @@ function PairDeviceRow() {
   );
 }
 
-function RemoveHostSection({ host, onRemoved }: { host: HostProfile; onRemoved?: () => void }) {
+function RemoveHostSection({
+  host,
+  isLocalDaemon,
+  onRemoved,
+}: {
+  host: HostProfile;
+  isLocalDaemon: boolean;
+  onRemoved?: () => void;
+}) {
   const { theme } = useUnistyles();
   const { removeHost } = useHostMutations();
+  const { updateSettings } = useDesktopSettings();
+  const { data: daemonStatusData, setStatus } = useDaemonStatus();
   const [isConfirming, setIsConfirming] = useState(false);
   const [isRemoving, setIsRemoving] = useState(false);
+  const daemonStatus = daemonStatusData?.status ?? null;
 
   const destructiveTextStyle = useMemo(
     () => ({ color: theme.colors.destructive }),
@@ -716,9 +856,45 @@ function RemoveHostSection({ host, onRemoved }: { host: HostProfile; onRemoved?:
     setIsConfirming(false);
   }, [isRemoving]);
   const handleCancel = useCallback(() => setIsConfirming(false), []);
+  const rollbackLocalhostRemoval = useCallback(
+    async (shouldRestartDaemon: boolean) => {
+      await updateSettings({ daemon: { manageBuiltInDaemon: true } });
+      if (!shouldRestartDaemon) {
+        return;
+      }
+      setStatus(await startDesktopDaemon());
+    },
+    [setStatus, updateSettings],
+  );
   const handleConfirmRemove = useCallback(() => {
     setIsRemoving(true);
-    void removeHost(host.serverId)
+    const remove = async () => {
+      let didDisableDaemonManagement = false;
+      let didStopDaemon = false;
+      if (isLocalDaemon) {
+        try {
+          await updateSettings({ daemon: { manageBuiltInDaemon: false } });
+          didDisableDaemonManagement = true;
+          if (daemonStatus?.status === "running" && daemonStatus.desktopManaged) {
+            setStatus(await stopDesktopDaemon());
+            didStopDaemon = true;
+          }
+          await removeHost(host.serverId);
+        } catch (error) {
+          if (didDisableDaemonManagement) {
+            try {
+              await rollbackLocalhostRemoval(didStopDaemon);
+            } catch (rollbackError) {
+              console.error("[HostPage] Failed to roll back localhost removal", rollbackError);
+            }
+          }
+          throw error;
+        }
+        return;
+      }
+      await removeHost(host.serverId);
+    };
+    void remove()
       .then(() => {
         setIsConfirming(false);
         onRemoved?.();
@@ -726,10 +902,29 @@ function RemoveHostSection({ host, onRemoved }: { host: HostProfile; onRemoved?:
       })
       .catch((error) => {
         console.error("[HostPage] Failed to remove host", error);
-        Alert.alert("Error", "Unable to remove host");
+        Alert.alert(
+          "Error",
+          isLocalDaemon ? "Unable to remove localhost connection" : "Unable to remove host",
+        );
       })
       .finally(() => setIsRemoving(false));
-  }, [host.serverId, onRemoved, removeHost]);
+  }, [
+    daemonStatus,
+    host.serverId,
+    isLocalDaemon,
+    onRemoved,
+    removeHost,
+    rollbackLocalhostRemoval,
+    setStatus,
+    updateSettings,
+  ]);
+
+  const confirmationHeader = useMemo<SheetHeader>(
+    () => ({
+      title: isLocalDaemon ? "Remove localhost connection and stop daemon?" : "Remove host",
+    }),
+    [isLocalDaemon],
+  );
 
   const removeIcon = useMemo(
     () => <Trash2 size={theme.iconSize.sm} color={theme.colors.destructive} />,
@@ -743,9 +938,13 @@ function RemoveHostSection({ host, onRemoved }: { host: HostProfile; onRemoved?:
       <View style={settingsStyles.card}>
         <View style={settingsStyles.row}>
           <View style={settingsStyles.rowContent}>
-            <Text style={settingsStyles.rowTitle}>Remove host</Text>
+            <Text style={settingsStyles.rowTitle}>
+              {isLocalDaemon ? "Remove localhost connection" : "Remove host"}
+            </Text>
             <Text style={settingsStyles.rowHint}>
-              Removes this host and its saved connections from this device
+              {isLocalDaemon
+                ? "Removes localhost from this device and stops the built-in daemon"
+                : "Removes this host and its saved connections from this device"}
             </Text>
           </View>
           <Button
@@ -763,13 +962,15 @@ function RemoveHostSection({ host, onRemoved }: { host: HostProfile; onRemoved?:
 
       {isConfirming ? (
         <AdaptiveModalSheet
-          header={REMOVE_HOST_HEADER}
+          header={confirmationHeader}
           visible
           onClose={handleCloseConfirm}
           testID="remove-host-confirm-modal"
         >
           <Text style={styles.confirmText}>
-            Remove {host.label}? This will delete its saved connections.
+            {isLocalDaemon
+              ? "This will remove the localhost connection, turn off built-in daemon management, and stop the managed daemon. Remote hosts remain connected."
+              : `Remove ${host.label}? This will delete its saved connections.`}
           </Text>
           <View style={styles.confirmActions}>
             <Button
@@ -802,6 +1003,18 @@ const styles = StyleSheet.create((theme) => ({
   identityEditButton: {
     padding: theme.spacing[1],
     borderRadius: theme.borderRadius.md,
+  },
+  daemonHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[1],
+    marginBottom: theme.spacing[4],
+  },
+  daemonHeaderLabel: {
+    flexShrink: 1,
+    fontSize: theme.fontSize.base,
+    fontWeight: theme.fontWeight.medium,
+    color: theme.colors.foreground,
   },
   identityBadges: {
     flexDirection: "row",

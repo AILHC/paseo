@@ -47,7 +47,7 @@ function buildModelRows(
     providerLabel,
     modelId: model.id,
     modelLabel: model.label,
-    description: model.description,
+    description: model.description ?? model.id,
     isDefault: model.isDefault,
   }));
 }
@@ -161,6 +161,9 @@ export function resolveSelectedModelLabel(input: {
   }
   if (provider.modelSelection.kind === "loading") {
     return "Loading...";
+  }
+  if (provider.modelSelection.kind === "error") {
+    return "Error";
   }
   if (provider.modelSelection.kind !== "models") {
     return "Select model";

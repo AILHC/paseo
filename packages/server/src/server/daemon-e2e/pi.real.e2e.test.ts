@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -6,19 +6,25 @@ import { beforeAll, beforeEach, expect, test } from "vitest";
 import pino from "pino";
 
 import type {
+  AgentClient,
   AgentPersistenceHandle,
   AgentStreamEvent,
   AgentTimelineItem,
 } from "../agent/agent-sdk-types.js";
-import { PiRpcAgentClient } from "../agent/providers/pi/agent.js";
 import { DaemonClient } from "../test-utils/daemon-client.js";
 import { createTestPaseoDaemon } from "../test-utils/paseo-daemon.js";
-import { isProviderAvailable } from "./agent-configs.js";
+import {
+  canRunRealProvider,
+  createRealProviderClient,
+  createRealProviderClients,
+  getRealProviderConfig,
+} from "./real-provider-test-config.js";
 
 process.env.PASEO_SUPERVISED = "0";
 
 const PI_TEST_TIMEOUT_MS = 240_000;
-const PI_REAL_TEST_MODEL = "openrouter/google/gemini-2.5-flash-lite";
+const PI_REAL_TEST_MODEL = getRealProviderConfig("pi").model;
+const PI_FREE_COMPACTION_TEST_MODEL = "openrouter/openai/gpt-oss-20b:free";
 
 type ToolCallItem = Extract<AgentTimelineItem, { type: "tool_call" }>;
 
@@ -26,14 +32,26 @@ function tmpCwd(prefix = "daemon-real-pi-"): string {
   return mkdtempSync(path.join(tmpdir(), prefix));
 }
 
-function createPiClient(): PiRpcAgentClient {
-  return new PiRpcAgentClient({ logger: pino({ level: "silent" }) });
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function writePiCompactionSettings(
+  cwd: string,
+  compaction: { enabled: boolean; reserveTokens?: number; keepRecentTokens?: number },
+): void {
+  mkdirSync(path.join(cwd, ".pi"), { recursive: true });
+  writeFileSync(path.join(cwd, ".pi/settings.json"), JSON.stringify({ compaction }, null, 2));
+}
+
+function createPiClient(): AgentClient {
+  return createRealProviderClient("pi", pino({ level: "silent" }));
 }
 
 function createPiToolDaemon() {
   const logger = pino({ level: "silent" });
   return createTestPaseoDaemon({
-    agentClients: { pi: new PiRpcAgentClient({ logger }) },
+    agentClients: createRealProviderClients(["pi"], logger),
     logger,
   });
 }
@@ -63,6 +81,27 @@ async function fetchCanonicalTimeline(
   return timeline.entries.map((entry) => entry.item);
 }
 
+async function waitForTimelineItem(
+  client: DaemonClient,
+  agentId: string,
+  predicate: (item: AgentTimelineItem) => boolean,
+  timeoutMs = PI_TEST_TIMEOUT_MS,
+): Promise<AgentTimelineItem> {
+  const deadline = Date.now() + timeoutMs;
+  let lastItems: AgentTimelineItem[] = [];
+  while (Date.now() < deadline) {
+    lastItems = await fetchCanonicalTimeline(client, agentId);
+    const item = lastItems.find(predicate);
+    if (item) {
+      return item;
+    }
+    await sleep(250);
+  }
+  throw new Error(
+    `Timed out waiting for Pi timeline item. Last timeline: ${JSON.stringify(lastItems)}`,
+  );
+}
+
 async function withConnectedPiDaemon(
   run: (context: { client: DaemonClient }) => Promise<void>,
 ): Promise<void> {
@@ -87,7 +126,7 @@ async function withConnectedPiDaemon(
 let canRun = false;
 
 beforeAll(async () => {
-  canRun = await isProviderAvailable("pi");
+  canRun = await canRunRealProvider("pi");
 });
 
 beforeEach((context) => {
@@ -95,6 +134,200 @@ beforeEach((context) => {
     context.skip();
   }
 });
+
+test(
+  "real Pi daemon lists Paseo-handled compact slash commands",
+  async () => {
+    const cwd = tmpCwd("pi-compact-commands-");
+
+    try {
+      await withConnectedPiDaemon(async ({ client }) => {
+        const agent = await client.createAgent({
+          cwd,
+          title: "pi-compact-commands",
+          provider: "pi",
+          model: PI_FREE_COMPACTION_TEST_MODEL,
+        });
+
+        const result = await client.listCommands(agent.id);
+        expect(result.commands).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              name: "compact",
+              description: "Manually compact the session context",
+            }),
+            expect.objectContaining({
+              name: "autocompact",
+              description: "Toggle automatic context compaction",
+            }),
+          ]),
+        );
+      });
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  },
+  PI_TEST_TIMEOUT_MS,
+);
+
+test(
+  "real Pi daemon executes manual compact out-of-band instead of prompt text",
+  async () => {
+    const cwd = tmpCwd("pi-manual-compact-");
+
+    try {
+      writePiCompactionSettings(cwd, {
+        enabled: true,
+        keepRecentTokens: 1,
+      });
+
+      await withConnectedPiDaemon(async ({ client }) => {
+        const agent = await client.createAgent({
+          cwd,
+          title: "pi-manual-compact",
+          provider: "pi",
+          model: PI_FREE_COMPACTION_TEST_MODEL,
+        });
+
+        await client.sendMessage(agent.id, "Reply exactly: compact-ready");
+        const finish = await client.waitForFinish(agent.id, PI_TEST_TIMEOUT_MS);
+        expect(finish.status).toBe("idle");
+
+        await client.sendMessage(agent.id, "/compact summarize this e2e run");
+
+        await waitForTimelineItem(
+          client,
+          agent.id,
+          (item) => item.type === "compaction" && item.status === "completed",
+        );
+
+        const items = await fetchCanonicalTimeline(client, agent.id);
+        expect(items).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              type: "compaction",
+              status: "loading",
+              trigger: "manual",
+            }),
+            expect.objectContaining({
+              type: "compaction",
+              status: "completed",
+            }),
+          ]),
+        );
+        expect(
+          items.some((item) => item.type === "user_message" && item.text.includes("/compact")),
+        ).toBe(false);
+        expect(
+          items.some(
+            (item) => item.type === "assistant_message" && item.text.includes("Failed to compact"),
+          ),
+        ).toBe(false);
+      });
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  },
+  PI_TEST_TIMEOUT_MS,
+);
+
+test(
+  "real Pi daemon toggles auto-compaction out-of-band instead of prompt text",
+  async () => {
+    const cwd = tmpCwd("pi-autocompact-toggle-");
+
+    try {
+      await withConnectedPiDaemon(async ({ client }) => {
+        const agent = await client.createAgent({
+          cwd,
+          title: "pi-autocompact-toggle",
+          provider: "pi",
+          model: PI_FREE_COMPACTION_TEST_MODEL,
+        });
+
+        await client.sendMessage(agent.id, "/autocompact off");
+        await waitForTimelineItem(
+          client,
+          agent.id,
+          (item) => item.type === "assistant_message" && item.text === "Auto-compaction disabled.",
+        );
+
+        await client.sendMessage(agent.id, "/autocompact");
+        await waitForTimelineItem(
+          client,
+          agent.id,
+          (item) => item.type === "assistant_message" && item.text === "Auto-compaction enabled.",
+        );
+
+        const items = await fetchCanonicalTimeline(client, agent.id);
+        expect(
+          items.some((item) => item.type === "user_message" && item.text.includes("/autocompact")),
+        ).toBe(false);
+      });
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  },
+  PI_TEST_TIMEOUT_MS,
+);
+
+test(
+  "real Pi daemon surfaces automatic threshold compaction events",
+  async () => {
+    const cwd = tmpCwd("pi-auto-compact-");
+
+    try {
+      writePiCompactionSettings(cwd, {
+        enabled: true,
+        reserveTokens: 126_000,
+        keepRecentTokens: 1,
+      });
+
+      await withConnectedPiDaemon(async ({ client }) => {
+        const agent = await client.createAgent({
+          cwd,
+          title: "pi-auto-compact",
+          provider: "pi",
+          model: PI_FREE_COMPACTION_TEST_MODEL,
+        });
+
+        await client.sendMessage(agent.id, "Reply exactly: auto-compact-ready");
+        const finish = await client.waitForFinish(agent.id, PI_TEST_TIMEOUT_MS);
+        expect(finish.status, JSON.stringify(finish)).toBe("idle");
+
+        await waitForTimelineItem(
+          client,
+          agent.id,
+          (item) => item.type === "compaction" && item.status === "completed",
+        );
+
+        const items = await fetchCanonicalTimeline(client, agent.id);
+        expect(items).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              type: "compaction",
+              status: "loading",
+              trigger: "auto",
+            }),
+            expect.objectContaining({
+              type: "compaction",
+              status: "completed",
+            }),
+          ]),
+        );
+        expect(
+          items.some(
+            (item) =>
+              item.type === "assistant_message" && item.text.includes("Auto-compaction failed"),
+          ),
+        ).toBe(false);
+      });
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  },
+  PI_TEST_TIMEOUT_MS,
+);
 
 test(
   "bash tool call records completed shell detail and output",

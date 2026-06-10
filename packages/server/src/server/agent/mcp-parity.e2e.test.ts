@@ -166,7 +166,7 @@ async function createChildAgent(args?: Partial<StructuredContent>): Promise<stri
     title: "Parity child",
     provider: "claude/claude-test-model",
     initialPrompt: "say done and stop",
-    background: true,
+    notifyOnFinish: false,
     ...args,
   });
   return str(payload.agentId);
@@ -286,6 +286,17 @@ describe("Suite A: Core Fixes", () => {
     }
   });
 
+  test("create_agent with detached true omits the parent agent label", async () => {
+    let agentId: string | null = null;
+    try {
+      agentId = await createChildAgent({ detached: true });
+      const snapshot = daemonHandle.daemon.agentManager.getAgent(agentId);
+      expect(snapshot?.labels?.[PARENT_AGENT_ID_LABEL]).toBeUndefined();
+    } finally {
+      await archiveAgentIfPresent(agentId);
+    }
+  });
+
   test("agentManager.createAgent injects paseo MCP using the daemon listen target", async () => {
     let agentId: string | null = null;
     try {
@@ -306,7 +317,11 @@ describe("Suite A: Core Fixes", () => {
         agentId,
       });
 
-      expect(snapshot.config.mcpServers).toMatchObject({
+      expect(snapshot.config.mcpServers).toBeUndefined();
+      const launchConfig = Reflect.get(snapshot.session as object, "config") as {
+        mcpServers?: unknown;
+      };
+      expect(launchConfig.mcpServers).toMatchObject({
         paseo: {
           type: "http",
           url: expectedUrl,
@@ -314,7 +329,11 @@ describe("Suite A: Core Fixes", () => {
       });
 
       const liveAgent = daemonHandle.daemon.agentManager.getAgent(agentId);
-      expect(liveAgent?.config.mcpServers).toMatchObject({
+      expect(liveAgent?.config.mcpServers).toBeUndefined();
+      const liveLaunchConfig = Reflect.get(liveAgent?.session as object, "config") as {
+        mcpServers?: unknown;
+      };
+      expect(liveLaunchConfig.mcpServers).toMatchObject({
         paseo: {
           type: "http",
           url: expectedUrl,
@@ -565,7 +584,7 @@ describe("Suite C: Schedule Tools", () => {
     try {
       const created = await callToolStructured(topLevelClient, "create_schedule", {
         prompt: "say hello",
-        every: "5m",
+        cron: "*/5 * * * *",
         name: "Parity schedule list",
         provider: "claude",
       });
@@ -591,7 +610,7 @@ describe("Suite C: Schedule Tools", () => {
     try {
       const created = await callToolStructured(topLevelClient, "create_schedule", {
         prompt: "say hello",
-        every: "5m",
+        cron: "*/5 * * * *",
         name: "Parity provider schedule",
         provider: "codex/gpt-5.4",
       });
@@ -613,7 +632,7 @@ describe("Suite C: Schedule Tools", () => {
     try {
       const created = await callToolStructured(topLevelClient, "create_schedule", {
         prompt: "say hello",
-        every: "5m",
+        cron: "*/5 * * * *",
         name: "Parity inspect schedule",
         provider: "claude",
       });
@@ -638,7 +657,7 @@ describe("Suite C: Schedule Tools", () => {
     try {
       const created = await callToolStructured(topLevelClient, "create_schedule", {
         prompt: "say hello",
-        every: "5m",
+        cron: "*/5 * * * *",
         name: "Parity pause schedule",
         provider: "claude",
       });
@@ -665,7 +684,7 @@ describe("Suite C: Schedule Tools", () => {
     try {
       const created = await callToolStructured(topLevelClient, "create_schedule", {
         prompt: "say hello",
-        every: "5m",
+        cron: "*/5 * * * *",
         name: "Parity delete schedule",
         provider: "claude",
       });
@@ -682,14 +701,13 @@ describe("Suite C: Schedule Tools", () => {
     }
   });
 
-  test("create_schedule target self with callerAgentId", async () => {
+  test("create_heartbeat targets the scoped agent", async () => {
     let scheduleId: string | null = null;
     try {
-      const created = await callToolStructured(agentScopedClient, "create_schedule", {
+      const created = await callToolStructured(agentScopedClient, "create_heartbeat", {
         prompt: "say hello",
-        every: "5m",
-        name: "Parity self schedule",
-        target: "self",
+        cron: "*/5 * * * *",
+        name: "Parity heartbeat",
       });
       scheduleId = str(created.id);
       expect(created.target).toMatchObject({
@@ -706,7 +724,7 @@ describe("Suite C: Schedule Tools", () => {
     try {
       const created = await callToolStructured(agentScopedClient, "create_schedule", {
         prompt: "say hello",
-        every: "5m",
+        cron: "*/5 * * * *",
         provider: "codex/gpt-5.4",
       });
       scheduleId = str(created.id);
@@ -722,16 +740,15 @@ describe("Suite C: Schedule Tools", () => {
     }
   });
 
-  test("create_schedule target self without callerAgentId throws", async () => {
+  test("create_heartbeat without callerAgentId throws", async () => {
     await expectToolError(
       topLevelClient,
-      "create_schedule",
+      "create_heartbeat",
       {
         prompt: "say hello",
-        every: "5m",
-        target: "self",
+        cron: "*/5 * * * *",
       },
-      /requires a caller agent/i,
+      /requires an agent-scoped session/i,
     );
   });
 });

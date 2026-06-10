@@ -23,7 +23,6 @@ import type { AgentProvider } from "@getpaseo/protocol/agent-types";
 import type { SheetHeader } from "@/components/adaptive-modal-sheet";
 import { useProviderSettingsStore } from "@/stores/provider-settings-store";
 import { Button } from "@/components/ui/button";
-import { useProvidersSnapshot } from "@/hooks/use-providers-snapshot";
 const IS_WEB = platformIsWeb;
 
 import { Combobox, ComboboxItem, type ComboboxOption } from "@/components/ui/combobox";
@@ -64,8 +63,10 @@ import {
   type ProviderSelectorProvider,
 } from "@/provider-selection/provider-selection";
 
-// TODO: this should be configured per provider in the provider manifest
-const PROVIDERS_WITH_MODEL_DESCRIPTIONS = new Set(["opencode", "pi"]);
+const DESKTOP_PROVIDER_VIEW_MIN_HEIGHT = 220;
+const DESKTOP_PROVIDER_VIEW_MAX_HEIGHT = 400;
+const DESKTOP_PROVIDER_VIEW_BASE_HEIGHT = 80;
+const DESKTOP_MODEL_ROW_HEIGHT = 40;
 
 type SelectorView =
   | { kind: "all" }
@@ -87,6 +88,8 @@ interface CombinedModelSelectorProps {
   }) => React.ReactNode;
   onOpen?: () => void;
   onClose?: () => void;
+  onRetryProvider?: (provider: AgentProvider) => void;
+  isRetryingProvider?: boolean;
   disabled?: boolean;
   serverId?: string | null;
 }
@@ -101,7 +104,8 @@ interface SelectorContentProps {
   onSelect: (provider: string, modelId: string) => void;
   onToggleFavorite?: (provider: string, modelId: string) => void;
   onDrillDown: (providerId: string, providerLabel: string) => void;
-  serverId: string | null;
+  onRetryProvider?: (provider: AgentProvider) => void;
+  isRetryingProvider: boolean;
 }
 
 function normalizeSearchQuery(value: string): string {
@@ -192,12 +196,10 @@ function ModelRow({
     ],
   );
 
-  const showDescription = row.description && PROVIDERS_WITH_MODEL_DESCRIPTIONS.has(row.provider);
-
   return (
     <ComboboxItem
       label={row.modelLabel}
-      description={showDescription ? row.description : undefined}
+      description={row.description}
       selected={isSelected}
       elevated={elevated}
       onPress={onPress}
@@ -418,26 +420,29 @@ function ProviderModelRows({
 }
 
 function ProviderErrorEmptyState({
-  serverId,
   providerId,
   message,
+  onRetryProvider,
+  isRetryingProvider,
 }: {
-  serverId: string | null;
   providerId: string;
   message: string;
+  onRetryProvider?: (provider: AgentProvider) => void;
+  isRetryingProvider: boolean;
 }) {
   const { theme } = useUnistyles();
-  const { refresh, isRefreshing } = useProvidersSnapshot(serverId);
   const handleRetry = useCallback(() => {
-    void refresh([providerId]);
-  }, [refresh, providerId]);
+    onRetryProvider?.(providerId);
+  }, [onRetryProvider, providerId]);
   return (
     <View style={styles.emptyState}>
       <AlertTriangle size={theme.iconSize.md} color={theme.colors.foregroundMuted} />
       <Text style={styles.emptyStateText}>{message}</Text>
-      <Button variant="default" size="sm" onPress={handleRetry} disabled={isRefreshing}>
-        {isRefreshing ? "Retrying…" : "Retry"}
-      </Button>
+      {onRetryProvider ? (
+        <Button variant="default" size="sm" onPress={handleRetry} disabled={isRetryingProvider}>
+          {isRetryingProvider ? "Retrying…" : "Retry"}
+        </Button>
+      ) : null}
     </View>
   );
 }
@@ -452,7 +457,8 @@ function SelectorContent({
   onSelect,
   onToggleFavorite,
   onDrillDown,
-  serverId,
+  onRetryProvider,
+  isRetryingProvider,
 }: SelectorContentProps) {
   const { theme } = useUnistyles();
   const normalizedQuery = useMemo(() => normalizeSearchQuery(searchQuery), [searchQuery]);
@@ -502,9 +508,10 @@ function SelectorContent({
     if (drillSelection.kind === "error") {
       return (
         <ProviderErrorEmptyState
-          serverId={serverId}
           providerId={view.providerId}
           message={drillSelection.message}
+          onRetryProvider={onRetryProvider}
+          isRetryingProvider={isRetryingProvider}
         />
       );
     }
@@ -556,6 +563,8 @@ export function CombinedModelSelector({
   renderTrigger,
   onOpen,
   onClose,
+  onRetryProvider,
+  isRetryingProvider = false,
   disabled = false,
   serverId = null,
 }: CombinedModelSelectorProps) {
@@ -630,8 +639,17 @@ export function CombinedModelSelector({
       return undefined;
     }
     const provider = providers.find((entry) => entry.id === view.providerId);
-    const modelCount = provider ? getProviderModelRows(provider).length : 0;
-    return Math.min(80 + modelCount * 40, 400);
+    if (!provider || provider.modelSelection.kind !== "models") {
+      return DESKTOP_PROVIDER_VIEW_MIN_HEIGHT;
+    }
+    const modelCount = getProviderModelRows(provider).length;
+    return Math.min(
+      Math.max(
+        DESKTOP_PROVIDER_VIEW_MIN_HEIGHT,
+        DESKTOP_PROVIDER_VIEW_BASE_HEIGHT + modelCount * DESKTOP_MODEL_ROW_HEIGHT,
+      ),
+      DESKTOP_PROVIDER_VIEW_MAX_HEIGHT,
+    );
   }, [providers, view]);
 
   const triggerLabel = useMemo(() => {
@@ -663,10 +681,6 @@ export function CombinedModelSelector({
     handleOpenChange(!isOpen);
   }, [handleOpenChange, isOpen]);
 
-  const handleClose = useCallback(() => {
-    handleOpenChange(false);
-  }, [handleOpenChange]);
-
   const triggerStyle = useCallback(
     ({ pressed, hovered }: PressableStateCallbackType & { hovered?: boolean }) => [
       styles.trigger,
@@ -692,11 +706,10 @@ export function CombinedModelSelector({
     setSearchQuery(value);
   }, []);
 
-  const openHeaderProviderSettings = useCallback(() => {
+  const openProviderSettings = useCallback(() => {
     if (!serverId || view.kind !== "provider") return;
     useProviderSettingsStore.getState().open({ serverId, provider: view.providerId });
-    handleClose();
-  }, [serverId, view, handleClose]);
+  }, [serverId, view]);
 
   const sheetHeader = useMemo<SheetHeader>(() => {
     if (view.kind === "all") {
@@ -705,7 +718,7 @@ export function CombinedModelSelector({
     const ProviderIconForView = getProviderIcon(view.providerId);
     const headerActions = (
       <Pressable
-        onPress={openHeaderProviderSettings}
+        onPress={openProviderSettings}
         disabled={!serverId}
         hitSlop={8}
         style={iconButtonStyle}
@@ -738,7 +751,7 @@ export function CombinedModelSelector({
     view,
     singleProviderView,
     serverId,
-    openHeaderProviderSettings,
+    openProviderSettings,
     theme.colors.border,
     theme.colors.foregroundMuted,
     handleBackToAll,
@@ -804,7 +817,8 @@ export function CombinedModelSelector({
             onSelect={handleSelect}
             onToggleFavorite={onToggleFavorite}
             onDrillDown={handleDrillDown}
-            serverId={serverId}
+            onRetryProvider={onRetryProvider}
+            isRetryingProvider={isRetryingProvider}
           />
         ) : (
           <View style={styles.sheetLoadingState}>

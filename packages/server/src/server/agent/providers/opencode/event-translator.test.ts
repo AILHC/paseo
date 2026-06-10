@@ -31,6 +31,8 @@ function createState(sessionId = "session-1"): OpenCodeEventTranslationState {
     accumulatedUsage: {},
     streamedPartKeys: new Set(),
     emittedStructuredMessageIds: new Set(),
+    compactionSummaryMessageIds: new Set(),
+    emittedCompactionPartIds: new Set(),
     partTypes: new Map(),
   };
 }
@@ -387,6 +389,97 @@ describe("translateOpenCodeEvent", () => {
     ]);
   });
 
+  it("forwards permission requests from linked OpenCode subagent sessions", () => {
+    const state = createState();
+
+    translateOpenCodeEvent(
+      {
+        type: "message.part.updated",
+        properties: {
+          part: {
+            id: "part-subagent",
+            sessionID: "session-1",
+            messageID: "message-1",
+            type: "tool",
+            tool: "task",
+            callID: "call-subagent",
+            state: {
+              status: "running",
+              input: {
+                subagent_type: "explore",
+                description: "Explore external config",
+              },
+            },
+          },
+        },
+      },
+      state,
+    );
+    translateOpenCodeEvent(
+      {
+        type: "session.created",
+        properties: {
+          sessionID: "child-session-1",
+          info: {
+            id: "child-session-1",
+            parentID: "session-1",
+          },
+        },
+      },
+      state,
+    );
+
+    const result = translateOpenCodeEvent(
+      {
+        type: "permission.asked",
+        properties: {
+          id: "perm-child-1",
+          sessionID: "child-session-1",
+          permission: "external_directory",
+          patterns: ["/Users/example/.config/nvim"],
+          metadata: {
+            reason: "Need to inspect the requested config directory",
+          },
+        },
+      },
+      state,
+    );
+
+    expect(result).toEqual([
+      {
+        type: "permission_requested",
+        provider: "opencode",
+        request: {
+          id: "perm-child-1",
+          provider: "opencode",
+          name: "external_directory",
+          kind: "tool",
+          title: "Access external directory",
+          description:
+            "Need to inspect the requested config directory - Scope: /Users/example/.config/nvim",
+          input: {
+            patterns: ["/Users/example/.config/nvim"],
+            metadata: {
+              reason: "Need to inspect the requested config directory",
+            },
+          },
+          detail: {
+            type: "unknown",
+            input: {
+              permission: "external_directory",
+              patterns: ["/Users/example/.config/nvim"],
+              metadata: {
+                reason: "Need to inspect the requested config directory",
+              },
+            },
+            output: null,
+          },
+          actions: openCodePermissionActions,
+        },
+      },
+    ]);
+  });
+
   it("emits usage_updated after step-finish parts", () => {
     const state = createState();
     state.accumulatedUsage.contextWindowMaxTokens = 400_000;
@@ -705,6 +798,107 @@ describe("translateOpenCodeEvent", () => {
           type: "compaction",
           status: "loading",
           trigger: "auto",
+        },
+      },
+    ]);
+  });
+
+  it("does not render OpenCode compaction summaries as assistant messages", () => {
+    const state = createState();
+
+    const loading = translateOpenCodeEvent(
+      {
+        type: "message.part.updated",
+        properties: {
+          part: {
+            id: "compaction-part-1",
+            sessionID: "session-1",
+            messageID: "message-compaction-user-1",
+            type: "compaction",
+            auto: true,
+          },
+        },
+      },
+      state,
+    );
+
+    translateOpenCodeEvent(
+      {
+        type: "message.updated",
+        properties: {
+          info: {
+            id: "message-compaction-summary-1",
+            sessionID: "session-1",
+            role: "assistant",
+            mode: "compaction",
+            agent: "compaction",
+            summary: true,
+          },
+        },
+      },
+      state,
+    );
+
+    const summaryText = translateOpenCodeEvent(
+      {
+        type: "message.part.updated",
+        properties: {
+          part: {
+            id: "summary-text-part-1",
+            sessionID: "session-1",
+            messageID: "message-compaction-summary-1",
+            type: "text",
+            text: "## Goal\n- Preserve context while continuing the task.",
+            time: { start: 1, end: 2 },
+          },
+        },
+      },
+      state,
+    );
+
+    const duplicateLoading = translateOpenCodeEvent(
+      {
+        type: "message.part.updated",
+        properties: {
+          part: {
+            id: "compaction-part-1",
+            sessionID: "session-1",
+            messageID: "message-compaction-user-1",
+            type: "compaction",
+            auto: true,
+            tail_start_id: "message-tail-1",
+          },
+        },
+      },
+      state,
+    );
+
+    const completed = translateOpenCodeEvent(
+      {
+        type: "session.compacted",
+        properties: {
+          sessionID: "session-1",
+        },
+      },
+      state,
+    );
+
+    expect([...loading, ...summaryText, ...duplicateLoading, ...completed]).toEqual([
+      {
+        type: "timeline",
+        provider: "opencode",
+        item: {
+          type: "compaction",
+          status: "loading",
+          trigger: "auto",
+        },
+      },
+      {
+        type: "timeline",
+        provider: "opencode",
+        item: {
+          type: "compaction",
+          status: "completed",
         },
       },
     ]);

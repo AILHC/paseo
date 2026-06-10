@@ -10,6 +10,7 @@ import {
   ClaudeAgentClient,
   convertClaudeHistoryEntry,
   normalizeClaudeAskUserQuestionUpdatedInput,
+  toClaudeSdkMcpConfig,
 } from "./agent.js";
 import type { AgentTimelineItem, AgentUsage, AgentStreamEvent } from "../../agent-sdk-types.js";
 
@@ -397,28 +398,38 @@ describe("ClaudeAgentClient.listModels", () => {
   const logger = createTestLogger();
 
   test("returns hardcoded claude models", async () => {
-    const client = new ClaudeAgentClient({ logger, resolveBinary: async () => "/test/claude/bin" });
-    const models = await client.listModels({ cwd: "/tmp/claude-models", force: false });
+    const emptyConfigDir = await fs.mkdtemp(path.join(os.tmpdir(), "paseo-claude-models-empty-"));
+    try {
+      const client = new ClaudeAgentClient({
+        logger,
+        resolveBinary: async () => "/test/claude/bin",
+        configDir: emptyConfigDir,
+      });
+      const models = await client.listModels({ cwd: "/tmp/claude-models", force: false });
 
-    expect(models.map((m) => m.id)).toEqual([
-      "claude-opus-4-8[1m]",
-      "claude-opus-4-8",
-      "claude-opus-4-7[1m]",
-      "claude-opus-4-7",
-      "claude-opus-4-6[1m]",
-      "claude-opus-4-6",
-      "claude-sonnet-4-6[1m]",
-      "claude-sonnet-4-6",
-      "claude-haiku-4-5",
-    ]);
+      expect(models.map((m) => m.id)).toEqual([
+        "claude-fable-5",
+        "claude-opus-4-8[1m]",
+        "claude-opus-4-8",
+        "claude-opus-4-7[1m]",
+        "claude-opus-4-7",
+        "claude-opus-4-6[1m]",
+        "claude-opus-4-6",
+        "claude-sonnet-4-6[1m]",
+        "claude-sonnet-4-6",
+        "claude-haiku-4-5",
+      ]);
 
-    for (const model of models) {
-      expect(model.provider).toBe("claude");
-      expect(model.label.length).toBeGreaterThan(0);
+      for (const model of models) {
+        expect(model.provider).toBe("claude");
+        expect(model.label.length).toBeGreaterThan(0);
+      }
+
+      const defaultModel = models.find((m) => m.isDefault);
+      expect(defaultModel?.id).toBe("claude-opus-4-8");
+    } finally {
+      await fs.rm(emptyConfigDir, { recursive: true, force: true });
     }
-
-    const defaultModel = models.find((m) => m.isDefault);
-    expect(defaultModel?.id).toBe("claude-opus-4-8");
   });
 });
 
@@ -505,6 +516,98 @@ describe("ClaudeAgentClient binary resolution", () => {
     expect(queryFactory.mock.calls[0]?.[0].options.pathToClaudeCodeExecutable).toBe(
       customClaudePath,
     );
+
+    await session.close();
+  });
+});
+
+describe("ClaudeAgentSession features", () => {
+  const logger = createTestLogger();
+
+  function createQueryMock() {
+    const queryReturn = vi.fn(async () => undefined);
+    const queryMock = {
+      close: vi.fn(),
+      return: queryReturn,
+      applyFlagSettings: vi.fn(async () => undefined),
+      setModel: vi.fn(async () => undefined),
+    };
+    const queryFactory = vi.fn(() => queryMock);
+    return { queryFactory, queryMock };
+  }
+
+  test("lists fast mode only for supported Opus models", async () => {
+    const client = new ClaudeAgentClient({ logger, resolveBinary: async () => "/test/claude/bin" });
+
+    await expect(
+      client.listFeatures({
+        provider: "claude",
+        cwd: process.cwd(),
+        model: "claude-opus-4-8",
+      }),
+    ).resolves.toEqual([expect.objectContaining({ id: "fast_mode", value: false })]);
+
+    await expect(
+      client.listFeatures({
+        provider: "claude",
+        cwd: process.cwd(),
+        model: "claude-sonnet-4-6",
+      }),
+    ).resolves.toEqual([]);
+  });
+
+  test("passes initial fast mode through Claude flag settings", async () => {
+    const { queryFactory, queryMock } = createQueryMock();
+    const client = new ClaudeAgentClient({
+      logger,
+      queryFactory,
+      resolveBinary: async () => "/test/claude/bin",
+    });
+    const session = await client.createSession({
+      provider: "claude",
+      cwd: process.cwd(),
+      model: "claude-opus-4-8",
+      featureValues: { fast_mode: true },
+    });
+
+    await expect(
+      (
+        session as unknown as {
+          ensureQuery(): Promise<unknown>;
+        }
+      ).ensureQuery(),
+    ).resolves.toBeDefined();
+
+    expect(queryFactory.mock.calls[0]?.[0].options.settings).toMatchObject({ fastMode: true });
+    expect(queryMock.applyFlagSettings).toHaveBeenCalledWith({ fastMode: true });
+
+    await session.close();
+  });
+
+  test("toggles fast mode on the active query without restarting it", async () => {
+    const { queryFactory, queryMock } = createQueryMock();
+    const client = new ClaudeAgentClient({
+      logger,
+      queryFactory,
+      resolveBinary: async () => "/test/claude/bin",
+    });
+    const session = await client.createSession({
+      provider: "claude",
+      cwd: process.cwd(),
+      model: "claude-opus-4-8",
+    });
+
+    await (
+      session as unknown as {
+        ensureQuery(): Promise<unknown>;
+      }
+    ).ensureQuery();
+    await session.setFeature?.("fast_mode", true);
+
+    expect(queryFactory).toHaveBeenCalledTimes(1);
+    expect(queryMock.applyFlagSettings).toHaveBeenLastCalledWith({ fastMode: true });
+    expect(queryMock.close).not.toHaveBeenCalled();
+    expect(queryMock.return).not.toHaveBeenCalled();
 
     await session.close();
   });
@@ -1571,5 +1674,65 @@ describe("ClaudeAgentSession context window usage", () => {
         messageId: "assistant-third-party-1",
       },
     ]);
+  });
+});
+
+describe("toClaudeSdkMcpConfig", () => {
+  test("preserves alwaysLoad on stdio servers", () => {
+    expect(
+      toClaudeSdkMcpConfig({
+        type: "stdio",
+        command: "npx",
+        args: ["-y", "chrome-devtools-mcp@latest"],
+        alwaysLoad: true,
+      }),
+    ).toEqual({
+      type: "stdio",
+      command: "npx",
+      args: ["-y", "chrome-devtools-mcp@latest"],
+      env: undefined,
+      alwaysLoad: true,
+    });
+  });
+
+  test("preserves alwaysLoad on http servers", () => {
+    expect(
+      toClaudeSdkMcpConfig({
+        type: "http",
+        url: "https://example.com/mcp",
+        headers: { Authorization: "Bearer x" },
+        alwaysLoad: true,
+      }),
+    ).toEqual({
+      type: "http",
+      url: "https://example.com/mcp",
+      headers: { Authorization: "Bearer x" },
+      alwaysLoad: true,
+    });
+  });
+
+  test("preserves alwaysLoad on sse servers", () => {
+    expect(
+      toClaudeSdkMcpConfig({
+        type: "sse",
+        url: "https://example.com/sse",
+        alwaysLoad: true,
+      }),
+    ).toEqual({
+      type: "sse",
+      url: "https://example.com/sse",
+      headers: undefined,
+      alwaysLoad: true,
+    });
+  });
+
+  test("leaves alwaysLoad undefined when not provided (preserves default deferral)", () => {
+    const result = toClaudeSdkMcpConfig({
+      type: "stdio",
+      command: "uvx",
+      args: ["markitdown-mcp"],
+    });
+    expect(result.type).toBe("stdio");
+    expect(result.alwaysLoad).toBeUndefined();
   });
 });

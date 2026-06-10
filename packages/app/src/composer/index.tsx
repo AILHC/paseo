@@ -140,6 +140,10 @@ function resolveIsDesktopWebBreakpoint(isMobile: boolean): boolean {
   return isWeb && !isMobile;
 }
 
+function resolveCompactLayout(override: boolean | undefined, formFactor: boolean): boolean {
+  return override ?? formFactor;
+}
+
 function resolveMessagePlaceholder(isDesktopWebBreakpoint: boolean): string {
   return isDesktopWebBreakpoint ? DESKTOP_MESSAGE_PLACEHOLDER : MOBILE_MESSAGE_PLACEHOLDER;
 }
@@ -166,10 +170,12 @@ function buildCancelButtonStyle(isConnected: boolean, isCancellingAgent: boolean
 function buildRealtimeVoiceButtonStyle(
   hovered: boolean | undefined,
   voiceButtonDisabled: boolean,
+  reserveLeadingSpace: boolean,
 ): object[] {
   const hoveredStyle = hovered ? styles.iconButtonHovered : undefined;
   const disabledStyle = voiceButtonDisabled ? styles.buttonDisabled : undefined;
-  return [styles.realtimeVoiceButton, hoveredStyle, disabledStyle].filter(
+  const reserveStyle = reserveLeadingSpace ? styles.realtimeVoiceButtonCompactReserve : undefined;
+  return [styles.realtimeVoiceButton, reserveStyle, hoveredStyle, disabledStyle].filter(
     (value): value is object => Boolean(value),
   );
 }
@@ -190,6 +196,7 @@ function renderContextWindowMeter(
   contextWindowMaxTokens: number | null,
   contextWindowUsedTokens: number | null,
   totalCostUsd: number | null,
+  showPercentage: boolean,
 ): ReactElement | null {
   if (contextWindowMaxTokens === null || contextWindowUsedTokens === null) {
     return null;
@@ -199,6 +206,7 @@ function renderContextWindowMeter(
       maxTokens={contextWindowMaxTokens}
       usedTokens={contextWindowUsedTokens}
       totalCostUsd={totalCostUsd}
+      showPercentage={showPercentage}
     />
   );
 }
@@ -206,13 +214,13 @@ function renderContextWindowMeter(
 function resolveContextWindowPlacement(
   meter: ReactElement | null,
   isMobile: boolean,
-): { beforeVoiceContent: ReactNode; footerRight: ReactNode } {
+): { beforeVoiceContent: ReactNode; footerInlineContent: ReactNode } {
   if (isMobile) {
-    return { beforeVoiceContent: null, footerRight: meter };
+    return { beforeVoiceContent: null, footerInlineContent: meter };
   }
   return {
     beforeVoiceContent: <View style={styles.contextWindowMeterSlot}>{meter}</View>,
-    footerRight: null,
+    footerInlineContent: null,
   };
 }
 
@@ -221,14 +229,22 @@ interface RenderLeftContentArgs {
   agentId: string;
   serverId: string;
   focusInput: () => void;
+  isCompactLayout: boolean;
 }
 
 function renderLeftContent(args: RenderLeftContentArgs): ReactElement {
-  const { agentControls, agentId, serverId, focusInput } = args;
+  const { agentControls, agentId, serverId, focusInput, isCompactLayout } = args;
   if (resolveAgentControlsMode(agentControls) === "draft" && agentControls) {
-    return <DraftAgentControls {...agentControls} />;
+    return <DraftAgentControls {...agentControls} isCompactLayout={isCompactLayout} />;
   }
-  return <AgentControls agentId={agentId} serverId={serverId} onDropdownClose={focusInput} />;
+  return (
+    <AgentControls
+      agentId={agentId}
+      serverId={serverId}
+      onDropdownClose={focusInput}
+      isCompactLayout={isCompactLayout}
+    />
+  );
 }
 
 interface RenderAttachmentTrayArgs {
@@ -238,13 +254,18 @@ interface RenderAttachmentTrayArgs {
   handleRemoveAttachment: (index: number) => void;
 }
 
-function renderComposerFooter(footer: ReactNode, footerRight: ReactNode): ReactElement | null {
-  if (!footer && !footerRight) return null;
+function renderComposerFooter(
+  footer: ReactNode,
+  footerInlineContent: ReactNode,
+): ReactElement | null {
+  if (!footer && !footerInlineContent) return null;
   return (
     <View style={styles.footer}>
       <View style={styles.footerContent}>
-        <View style={styles.footerLeft}>{footer}</View>
-        <View style={styles.footerRight}>{footerRight}</View>
+        <View style={styles.footerLeft}>
+          {footer}
+          {footerInlineContent}
+        </View>
       </View>
     </View>
   );
@@ -665,6 +686,10 @@ interface ComposerProps {
   inputWrapperStyle?: import("react-native").ViewStyle;
   /** Rendered below the input, inside the keyboard-shifted container. */
   footer?: ReactNode;
+  /** When true, a parent wrapper owns the keyboard shift, so the composer skips its own. */
+  externalKeyboardShift?: boolean;
+  /** Optional panel/container layout breakpoint. Defaults to the screen breakpoint. */
+  isCompactLayout?: boolean;
 }
 
 const EMPTY_ARRAY: readonly QueuedMessage[] = [];
@@ -859,6 +884,8 @@ export function Composer({
   agentControls,
   inputWrapperStyle,
   footer,
+  externalKeyboardShift,
+  isCompactLayout: isCompactLayoutOverride,
 }: ComposerProps) {
   const buttonIconSize = resolveComposerButtonIconSize();
   const client = useHostRuntimeClient(serverId);
@@ -889,9 +916,11 @@ export function Composer({
   const setAgentStreamTail = useSessionStore((state) => state.setAgentStreamTail);
   const setAgentStreamHead = useSessionStore((state) => state.setAgentStreamHead);
 
-  const isMobile = useIsCompactFormFactor();
-  const isDesktopWebBreakpoint = resolveIsDesktopWebBreakpoint(isMobile);
-  const messagePlaceholder = resolveMessagePlaceholder(isDesktopWebBreakpoint);
+  const isCompactFormFactor = useIsCompactFormFactor();
+  const isCompactLayout = resolveCompactLayout(isCompactLayoutOverride, isCompactFormFactor);
+  const isDesktopWebBreakpoint = resolveIsDesktopWebBreakpoint(isCompactFormFactor);
+  const isDesktopLayout = resolveIsDesktopWebBreakpoint(isCompactLayout);
+  const messagePlaceholder = resolveMessagePlaceholder(isDesktopLayout);
   const userInput = value;
   const setUserInput = onChangeText;
   const {
@@ -1307,6 +1336,7 @@ export function Composer({
 
   const { style: keyboardAnimatedStyle } = useKeyboardShiftStyle({
     mode: "translate",
+    enabled: !externalKeyboardShift,
   });
 
   const isVoiceModeForAgent = resolveIsVoiceModeForAgent(voice, serverId, agentId);
@@ -1387,8 +1417,8 @@ export function Composer({
   const voiceButtonDisabled = !isConnected || isVoiceSwitching;
   const realtimeVoiceButtonStyle = useCallback(
     (state: PressableStateCallbackType & { hovered?: boolean }) =>
-      buildRealtimeVoiceButtonStyle(state.hovered, voiceButtonDisabled),
-    [voiceButtonDisabled],
+      buildRealtimeVoiceButtonStyle(state.hovered, voiceButtonDisabled, isCompactLayout),
+    [isCompactLayout, voiceButtonDisabled],
   );
 
   const cancelButton = useMemo(
@@ -1426,7 +1456,7 @@ export function Composer({
         isAgentRunning={isAgentRunning}
         hasSendableContent={hasSendableContent}
         isProcessing={isProcessing}
-        isCompact={isMobile}
+        isCompact={isCompactLayout}
         buttonIconSize={buttonIconSize}
         handleToggleRealtimeVoice={handleToggleRealtimeVoice}
         isConnected={isConnected}
@@ -1444,7 +1474,7 @@ export function Composer({
       hasSendableContent,
       isAgentRunning,
       isConnected,
-      isMobile,
+      isCompactLayout,
       isProcessing,
       isVoiceModeForAgent,
       isVoiceSwitching,
@@ -1464,12 +1494,13 @@ export function Composer({
         contextWindowMaxTokens,
         contextWindowUsedTokens,
         agentState.totalCostUsd,
+        isCompactLayout,
       ),
-    [contextWindowMaxTokens, contextWindowUsedTokens, agentState.totalCostUsd],
+    [contextWindowMaxTokens, contextWindowUsedTokens, agentState.totalCostUsd, isCompactLayout],
   );
-  const { beforeVoiceContent, footerRight } = useMemo(
-    () => resolveContextWindowPlacement(contextWindowMeter, isMobile),
-    [contextWindowMeter, isMobile],
+  const { beforeVoiceContent, footerInlineContent } = useMemo(
+    () => resolveContextWindowPlacement(contextWindowMeter, isCompactLayout),
+    [contextWindowMeter, isCompactLayout],
   );
 
   const githubSearchQueryTrimmed = githubSearchQuery.trim();
@@ -1536,8 +1567,8 @@ export function Composer({
   );
 
   const leftContent = useMemo(
-    () => renderLeftContent({ agentControls, agentId, serverId, focusInput }),
-    [agentId, focusInput, serverId, agentControls],
+    () => renderLeftContent({ agentControls, agentId, serverId, focusInput, isCompactLayout }),
+    [agentId, focusInput, serverId, agentControls, isCompactLayout],
   );
 
   const handleAttachButtonRef = useCallback((node: View | null) => {
@@ -1714,7 +1745,7 @@ export function Composer({
           </View>
         </View>
       </View>
-      {renderComposerFooter(footer, footerRight)}
+      {renderComposerFooter(footer, footerInlineContent)}
     </Animated.View>
   );
 }
@@ -1749,11 +1780,17 @@ const styles = StyleSheet.create((theme: Theme) => ({
   footer: {
     width: "100%",
     paddingHorizontal: theme.spacing[4],
+    // Negative margin pulls the footer up against the input area's paddingBottom.
+    // On mobile, leave a 3px gap (no token sits below spacing[1]); desktop keeps more.
     marginTop: {
-      xs: -theme.spacing[4],
+      xs: -(theme.spacing[4] - 3),
       md: -theme.spacing[3],
     },
     alignItems: "center",
+    paddingBottom: {
+      xs: 0,
+      md: theme.spacing[2],
+    },
   },
   footerContent: {
     width: "100%",
@@ -1761,12 +1798,14 @@ const styles = StyleSheet.create((theme: Theme) => ({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
+    // On mobile, the negative margins below cancel each glyph's internal padding
+    // to reach the composer border; this inset adds a small visual gap from it.
     paddingLeft: {
-      xs: 6,
+      xs: 5,
       md: 10,
     },
     paddingRight: {
-      xs: 6,
+      xs: 5,
       md: 10,
     },
   },
@@ -1774,11 +1813,13 @@ const styles = StyleSheet.create((theme: Theme) => ({
     flexShrink: 1,
     flexDirection: "row",
     alignItems: "center",
-  },
-  footerRight: {
-    flexShrink: 0,
-    flexDirection: "row",
-    alignItems: "center",
+    gap: theme.spacing[1],
+    // On mobile, cancel the leading glyph's internal padding (chip paddingHorizontal)
+    // so its icon aligns to the composer border before the footer inset is applied.
+    marginLeft: {
+      xs: -theme.spacing[2],
+      md: 0,
+    },
   },
   messageInputContainer: {
     position: "relative",
@@ -1811,6 +1852,9 @@ const styles = StyleSheet.create((theme: Theme) => ({
     borderRadius: theme.borderRadius.full,
     alignItems: "center",
     justifyContent: "center",
+  },
+  realtimeVoiceButtonCompactReserve: {
+    marginLeft: theme.spacing[1],
   },
   realtimeVoiceButtonActive: {
     backgroundColor: theme.colors.palette.green[600],

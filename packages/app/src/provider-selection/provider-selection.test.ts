@@ -56,7 +56,7 @@ describe("combined model selector data", () => {
               providerLabel: "Codex",
               modelId: "gpt-5.4",
               modelLabel: "GPT-5.4",
-              description: undefined,
+              description: "gpt-5.4",
               isDefault: undefined,
             },
           ],
@@ -69,22 +69,22 @@ describe("combined model selector data", () => {
     expect(
       buildSelectableProviderSelectorProviders([
         snapshotEntry({
-          provider: "deepseek-tui",
-          label: "DeepSeek TUI",
+          provider: "codewhale",
+          label: "CodeWhale",
           models: [],
         }),
       ]),
     ).toEqual([
       {
-        id: "deepseek-tui",
-        label: "DeepSeek TUI",
+        id: "codewhale",
+        label: "CodeWhale",
         modelSelection: {
           kind: "models",
           rows: [
             {
-              favoriteKey: "deepseek-tui:",
-              provider: "deepseek-tui",
-              providerLabel: "DeepSeek TUI",
+              favoriteKey: "codewhale:",
+              provider: "codewhale",
+              providerLabel: "CodeWhale",
               modelId: "",
               modelLabel: "Default",
               description: undefined,
@@ -100,8 +100,8 @@ describe("combined model selector data", () => {
     expect(
       buildSelectableProviderSelectorProviders([
         snapshotEntry({
-          provider: "deepseek-tui",
-          label: "DeepSeek TUI",
+          provider: "codewhale",
+          label: "CodeWhale",
           enabled: false,
           models: [],
         }),
@@ -235,8 +235,8 @@ describe("combined model selector data", () => {
         models: [codexModel],
       }),
       snapshotEntry({
-        provider: "deepseek-tui",
-        label: "DeepSeek TUI",
+        provider: "codewhale",
+        label: "CodeWhale",
         models: [],
       }),
     ]);
@@ -252,11 +252,32 @@ describe("combined model selector data", () => {
     expect(
       resolveSelectedModelLabel({
         providers,
-        selectedProvider: "deepseek-tui",
+        selectedProvider: "codewhale",
         selectedModel: "",
         isLoading: false,
       }),
     ).toBe("Default");
+  });
+
+  it("keeps provider snapshot errors visible in the selected trigger label", () => {
+    const providers = buildSelectableProviderSelectorProviders([
+      snapshotEntry({
+        provider: "opencode",
+        label: "OpenCode",
+        status: "error",
+        error: "OpenCode app.agents timed out after 10s",
+        models: [],
+      }),
+    ]);
+
+    expect(
+      resolveSelectedModelLabel({
+        providers,
+        selectedProvider: "opencode",
+        selectedModel: "",
+        isLoading: false,
+      }),
+    ).toBe("Error");
   });
 
   it("returns observable submission readiness reasons", () => {
@@ -286,7 +307,7 @@ describe("combined model selector data", () => {
         allowsEmptyAutoSubmit: false,
         providerCount: 1,
         selection: {
-          provider: "deepseek-tui",
+          provider: "codewhale",
           modelId: "",
           availableModels: [],
           isModelLoading: false,

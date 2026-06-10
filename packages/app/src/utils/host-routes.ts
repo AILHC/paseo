@@ -355,9 +355,30 @@ export function buildHostOpenProjectRoute(serverId: string) {
   return `${base}/open-project` as const;
 }
 
+export type KnownHostRouteResolution =
+  | { kind: "render" }
+  | { kind: "redirect"; href: ReturnType<typeof buildHostOpenProjectRoute> | "/welcome" };
+
+export function resolveKnownHostRoute(input: {
+  routeServerId: string | null | undefined;
+  hosts: readonly { serverId: string }[];
+}): KnownHostRouteResolution {
+  const routeServerId = trimNonEmpty(input.routeServerId);
+  if (routeServerId && input.hosts.some((host) => host.serverId === routeServerId)) {
+    return { kind: "render" };
+  }
+
+  const fallbackServerId = input.hosts[0]?.serverId;
+  if (fallbackServerId) {
+    return { kind: "redirect", href: buildHostOpenProjectRoute(fallbackServerId) };
+  }
+
+  return { kind: "redirect", href: "/welcome" };
+}
+
 export function buildHostNewWorkspaceRoute(
   serverId: string,
-  sourceDirectory: string,
+  sourceDirectory?: string,
   options?: { displayName?: string; projectId?: string },
 ) {
   const base = buildHostRootRoute(serverId);
@@ -365,18 +386,26 @@ export function buildHostNewWorkspaceRoute(
     return "/" as const;
   }
   const params = new URLSearchParams();
-  params.set("dir", sourceDirectory);
+  if (sourceDirectory) {
+    params.set("dir", sourceDirectory);
+  }
   if (options?.displayName) {
     params.set("name", options.displayName);
   }
   if (options?.projectId) {
     params.set("projectId", options.projectId);
   }
-  return `${base}/new?${params.toString()}` as const;
+  const query = params.toString();
+  if (!query) {
+    return `${base}/new` as const;
+  }
+  return `${base}/new?${query}` as const;
 }
 
 export const SETTINGS_SECTION_SLUGS = [
   "general",
+  "daemon",
+  "appearance",
   "shortcuts",
   "integrations",
   "permissions",
@@ -388,6 +417,32 @@ export type SettingsSectionSlug = (typeof SETTINGS_SECTION_SLUGS)[number];
 
 export function isSettingsSectionSlug(value: string): value is SettingsSectionSlug {
   return (SETTINGS_SECTION_SLUGS as readonly string[]).includes(value);
+}
+
+export const HOST_SECTION_SLUGS = [
+  "connections",
+  "agents",
+  "workspaces",
+  "providers",
+  "host",
+] as const;
+
+export type HostSectionSlug = (typeof HOST_SECTION_SLUGS)[number];
+
+const LEGACY_HOST_SECTION_SLUGS: Record<string, HostSectionSlug> = {
+  orchestration: "agents",
+  daemon: "host",
+};
+
+export function isHostSectionSlug(value: string): value is HostSectionSlug {
+  return (HOST_SECTION_SLUGS as readonly string[]).includes(value);
+}
+
+export function normalizeHostSectionSlug(value: string): HostSectionSlug | null {
+  if (isHostSectionSlug(value)) {
+    return value;
+  }
+  return LEGACY_HOST_SECTION_SLUGS[value] ?? null;
 }
 
 export function buildSettingsRoute() {
@@ -404,6 +459,14 @@ export function buildSettingsHostRoute(serverId: string) {
     throw new Error("buildSettingsHostRoute requires a non-empty serverId");
   }
   return `/settings/hosts/${encodeSegment(normalized)}` as const;
+}
+
+export function buildSettingsHostSectionRoute(serverId: string, section: HostSectionSlug) {
+  const normalized = trimNonEmpty(serverId);
+  if (!normalized) {
+    throw new Error("buildSettingsHostSectionRoute requires a non-empty serverId");
+  }
+  return `/settings/hosts/${encodeSegment(normalized)}/${section}` as const;
 }
 
 export function buildProjectsSettingsRoute() {

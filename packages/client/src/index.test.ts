@@ -125,6 +125,7 @@ function createWorkspace(input: Partial<PaseoWorkspace> = {}): PaseoWorkspace {
     name: "sdk",
     archivingAt: null,
     status: "done",
+    statusEnteredAt: null,
     activityAt: "2026-05-16T00:00:00.000Z",
     scripts: [],
     gitRuntime: null,
@@ -673,6 +674,7 @@ test("config actions delegate to existing daemon config RPCs", async () => {
     config: {
       mcp: { injectIntoAgents: true },
       providers: {},
+      metadataGeneration: { providers: [] },
       autoArchiveAfterMerge: false,
       appendSystemPrompt: "",
     },
@@ -725,6 +727,7 @@ test("config actions delegate to existing daemon config RPCs", async () => {
           enabled: false,
         },
       },
+      metadataGeneration: { providers: [] },
       autoArchiveAfterMerge: false,
       appendSystemPrompt: "",
     },

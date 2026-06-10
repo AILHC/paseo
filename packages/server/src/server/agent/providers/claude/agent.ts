@@ -32,6 +32,7 @@ import {
 import { getClaudeModelsWithSettings, normalizeClaudeRuntimeModelId } from "./models.js";
 import { parsePartialJsonObject } from "./partial-json.js";
 import { ClaudeSidechainTracker } from "./sidechain-tracker.js";
+import { buildClaudeFeatures, claudeModelSupportsFastMode } from "./feature-definitions.js";
 import {
   buildBinaryDiagnosticRows,
   formatDiagnosticStatus,
@@ -44,6 +45,7 @@ import { renderPromptAttachmentAsText } from "../../prompt-attachments.js";
 import { claudeQuery, type ClaudeOptions, type ClaudeQueryFactory } from "./query.js";
 import { realClaudeRewindSdk, revertClaudeConversation, revertClaudeFiles } from "./rewind.js";
 import { normalizeProviderReplayTimestamp } from "../../provider-history-timestamps.js";
+import { claudeProjectDirSync } from "./project-dir.js";
 
 import {
   getAgentStreamEventTurnId,
@@ -51,6 +53,7 @@ import {
   type AgentCapabilityFlags,
   type AgentClient,
   type AgentCreateSessionOptions,
+  type AgentFeature,
   type AgentLaunchContext,
   type AgentMetadata,
   type AgentMode,
@@ -70,11 +73,14 @@ import {
   type AgentTimelineItem,
   type AgentUsage,
   type AgentRuntimeInfo,
+  type ImportableProviderSession,
+  type ImportProviderSessionContext,
+  type ImportProviderSessionInput,
+  type ListImportableSessionsOptions,
   type ListModelsOptions,
-  type ListPersistedAgentsOptions,
   type McpServerConfig,
-  type PersistedAgentDescriptor,
 } from "../../agent-sdk-types.js";
+import { importSessionFromPersistence } from "../../provider-session-import.js";
 import {
   checkProviderLaunchAvailable,
   createProviderEnv,
@@ -207,6 +213,7 @@ type ClaudeConversationRewindTarget =
 const CLAUDE_CAPABILITIES: AgentCapabilityFlags = {
   supportsStreaming: true,
   supportsSessionPersistence: true,
+  supportsSessionListing: true,
   supportsDynamicModes: true,
   supportsMcpServers: true,
   supportsReasoningStream: true,
@@ -276,6 +283,7 @@ interface ClaudeAgentClientOptions {
   runtimeSettings?: ProviderRuntimeSettings;
   queryFactory?: ClaudeQueryFactory;
   resolveBinary?: () => Promise<string>;
+  configDir?: string;
 }
 
 interface ClaudeAgentSessionOptions {
@@ -341,10 +349,6 @@ function isClaudeThinkingEffort(value: string | null | undefined): value is Clau
   );
 }
 
-function sanitizeClaudeProjectPath(cwd: string): string {
-  return cwd.replace(/[\\/._:]/g, "-");
-}
-
 interface ClaudeOptionsLogSummary {
   cwd: string | null;
   permissionMode: string | null;
@@ -365,6 +369,7 @@ interface ClaudeOptionsLogSummary {
   hasStderrHandler: boolean;
   pathToClaudeCodeExecutable: string | null;
   persistSession: boolean | null;
+  fastMode: boolean | null;
 }
 
 const MAX_RECENT_STDERR_CHARS = 4000;
@@ -413,7 +418,25 @@ function summarizeClaudeOptionsForLog(options: ClaudeOptions): ClaudeOptionsLogS
         ? options.pathToClaudeCodeExecutable
         : null,
     persistSession: typeof options.persistSession === "boolean" ? options.persistSession : null,
+    fastMode: readClaudeFastModeSetting(options.settings),
   };
+}
+
+function readClaudeFastModeSetting(settings: ClaudeOptions["settings"]): boolean | null {
+  if (!settings || typeof settings === "string") {
+    return null;
+  }
+  return typeof settings.fastMode === "boolean" ? settings.fastMode : null;
+}
+
+function mergeClaudeSettings(
+  settings: ClaudeOptions["settings"],
+  updates: NonNullable<Exclude<ClaudeOptions["settings"], string>>,
+): ClaudeOptions["settings"] {
+  if (!settings || typeof settings === "string") {
+    return settings ?? updates;
+  }
+  return { ...settings, ...updates };
 }
 
 function isToolResultTextBlock(value: unknown): value is { type: "text"; text: string } {
@@ -785,7 +808,7 @@ function coerceSessionMetadata(metadata: AgentMetadata | undefined): Partial<Age
   return result;
 }
 
-function toClaudeSdkMcpConfig(config: McpServerConfig): ClaudeSdkMcpServerConfig {
+export function toClaudeSdkMcpConfig(config: McpServerConfig): ClaudeSdkMcpServerConfig {
   switch (config.type) {
     case "stdio":
       return {
@@ -793,18 +816,21 @@ function toClaudeSdkMcpConfig(config: McpServerConfig): ClaudeSdkMcpServerConfig
         command: config.command,
         args: config.args,
         env: config.env,
+        alwaysLoad: config.alwaysLoad,
       };
     case "http":
       return {
         type: "http",
         url: config.url,
         headers: config.headers,
+        alwaysLoad: config.alwaysLoad,
       };
     case "sse":
       return {
         type: "sse",
         url: config.url,
         headers: config.headers,
+        alwaysLoad: config.alwaysLoad,
       };
   }
   throw new Error("Unhandled MCP server config type");
@@ -1263,6 +1289,7 @@ export class ClaudeAgentClient implements AgentClient {
   private readonly runtimeSettings?: ProviderRuntimeSettings;
   private readonly queryFactory?: ClaudeQueryFactory;
   private readonly resolveBinary: () => Promise<string>;
+  private readonly configDir?: string;
 
   constructor(options: ClaudeAgentClientOptions) {
     this.defaults = options.defaults;
@@ -1270,6 +1297,7 @@ export class ClaudeAgentClient implements AgentClient {
     this.runtimeSettings = options.runtimeSettings;
     this.queryFactory = options.queryFactory;
     this.resolveBinary = options.resolveBinary ?? (() => resolveClaudeBinary(this.runtimeSettings));
+    this.configDir = options.configDir;
   }
 
   async createSession(
@@ -1320,12 +1348,20 @@ export class ClaudeAgentClient implements AgentClient {
 
   async listModels(_options: ListModelsOptions): Promise<AgentModelDefinition[]> {
     // Claude exposes a global catalog here; cwd/force are intentionally irrelevant.
-    return await getClaudeModelsWithSettings(this.logger);
+    return await getClaudeModelsWithSettings(this.logger, this.configDir);
   }
 
-  async listPersistedAgents(
-    options?: ListPersistedAgentsOptions,
-  ): Promise<PersistedAgentDescriptor[]> {
+  async listFeatures(config: AgentSessionConfig): Promise<AgentFeature[]> {
+    const claudeConfig = this.assertConfig(config);
+    return buildClaudeFeatures({
+      modelId: claudeConfig.model,
+      fastModeEnabled: claudeConfig.featureValues?.fast_mode === true,
+    });
+  }
+
+  async listImportableSessions(
+    options?: ListImportableSessionsOptions,
+  ): Promise<ImportableProviderSession[]> {
     const configDir = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
     const projectsRoot = path.join(configDir, "projects");
     if (!(await pathExists(projectsRoot))) {
@@ -1337,8 +1373,17 @@ export class ClaudeAgentClient implements AgentClient {
       candidates.map((candidate) => parseClaudeSessionDescriptor(candidate.path, candidate.mtime)),
     );
     return parsed
-      .filter((descriptor): descriptor is PersistedAgentDescriptor => descriptor !== null)
+      .filter((session): session is ImportableProviderSession => session !== null)
       .slice(0, limit);
+  }
+
+  async importSession(input: ImportProviderSessionInput, context: ImportProviderSessionContext) {
+    return importSessionFromPersistence({
+      provider: "claude",
+      request: input,
+      context,
+      resumeSession: this.resumeSession.bind(this),
+    });
   }
 
   async isAvailable(): Promise<boolean> {
@@ -1633,6 +1678,13 @@ class ClaudeAgentSession implements AgentSession {
     return this.claudeSessionId;
   }
 
+  get features(): AgentFeature[] {
+    return buildClaudeFeatures({
+      modelId: this.config.model,
+      fastModeEnabled: this.config.featureValues?.fast_mode === true,
+    });
+  }
+
   async getRuntimeInfo(): Promise<AgentRuntimeInfo> {
     if (this.cachedRuntimeInfo) {
       return { ...this.cachedRuntimeInfo };
@@ -1833,6 +1885,9 @@ class ClaudeAgentSession implements AgentSession {
     const activeQuery = await this.ensureQuery();
     await activeQuery.setModel(normalizedModelId ?? undefined);
     this.config.model = normalizedModelId ?? undefined;
+    if (!claudeModelSupportsFastMode(this.config.model) && this.config.featureValues?.fast_mode) {
+      await this.applyFastModeFeature(false, activeQuery);
+    }
     this.lastOptionsModel = normalizedModelId ?? this.lastOptionsModel;
     this.lastRuntimeModel = null;
     this.cachedRuntimeInfo = null;
@@ -1854,6 +1909,33 @@ class ClaudeAgentSession implements AgentSession {
       throw new Error(`Unknown thinking option: ${normalizedThinkingOptionId}`);
     }
     this.queryRestartNeeded = true;
+  }
+
+  async setFeature(featureId: string, value: unknown): Promise<void> {
+    if (featureId !== "fast_mode") {
+      throw new Error(`Unknown Claude feature: ${featureId}`);
+    }
+
+    const enabled = Boolean(value);
+    if (enabled && !claudeModelSupportsFastMode(this.config.model)) {
+      throw new Error(
+        `Claude fast mode is not available for model '${this.config.model ?? "default"}'`,
+      );
+    }
+
+    await this.applyFastModeFeature(enabled);
+  }
+
+  private async applyFastModeFeature(enabled: boolean, query?: Query): Promise<void> {
+    this.config.featureValues = {
+      ...this.config.featureValues,
+      fast_mode: enabled,
+    };
+    const activeQuery = query ?? this.query;
+    if (activeQuery) {
+      await activeQuery.applyFlagSettings({ fastMode: enabled });
+    }
+    this.cachedRuntimeInfo = null;
   }
 
   getPendingPermissions(): AgentPermissionRequest[] {
@@ -2016,6 +2098,7 @@ class ClaudeAgentSession implements AgentSession {
           name: cmd.name,
           description: cmd.description,
           argumentHint: cmd.argumentHint,
+          kind: "command",
         });
       }
     }
@@ -2393,6 +2476,10 @@ class ClaudeAgentSession implements AgentSession {
         queryFactory: this.queryFactory,
       },
     );
+    const fastMode = this.resolveFastModeSetting();
+    if (fastMode !== null) {
+      await this.query.applyFlagSettings({ fastMode });
+    }
     // Do not kick off background control-plane queries here. Methods like
     // supportedCommands()/setPermissionMode() may execute immediately after
     // ensureQuery() (for listCommands()/setMode()), and sharing the same query
@@ -2486,6 +2573,7 @@ class ClaudeAgentSession implements AgentSession {
     const { thinking, effort } = this.resolveThinkingConfig();
     const appendedSystemPrompt = this.buildAppendedSystemPrompt();
     const extraClaudeOptions = this.config.extra?.claude;
+    const fastModeOptions = this.buildFastModeOptions(extraClaudeOptions);
     const sdkEnv = this.buildSdkEnv(extraClaudeOptions);
     assertClaudeAutoModeEligible(this.currentMode, sdkEnv);
 
@@ -2538,6 +2626,7 @@ class ClaudeAgentSession implements AgentSession {
       ...(thinking ? { thinking } : {}),
       ...(effort ? { effort } : {}),
       ...extraClaudeOptions,
+      ...fastModeOptions,
       ...(this.persistSession === undefined ? {} : { persistSession: this.persistSession }),
       env: sdkEnv,
     };
@@ -2560,6 +2649,23 @@ class ClaudeAgentSession implements AgentSession {
       ];
     }
     return base;
+  }
+
+  private buildFastModeOptions(
+    extraClaudeOptions: Partial<ClaudeOptions> | undefined,
+  ): Pick<ClaudeOptions, "settings"> | Record<string, never> {
+    const fastMode = this.resolveFastModeSetting();
+    if (fastMode === null) {
+      return {};
+    }
+    return { settings: mergeClaudeSettings(extraClaudeOptions?.settings, { fastMode }) };
+  }
+
+  private resolveFastModeSetting(): boolean | null {
+    if (!claudeModelSupportsFastMode(this.config.model)) {
+      return null;
+    }
+    return this.config.featureValues?.fast_mode === true;
   }
 
   private normalizeMcpServers(
@@ -3900,14 +4006,15 @@ class ClaudeAgentSession implements AgentSession {
       // Fall back to the configured cwd when the path has already disappeared.
     }
     for (const candidate of candidates) {
-      const sanitized = sanitizeClaudeProjectPath(candidate);
-      const historyPath = path.join(configDir, "projects", sanitized, `${sessionId}.jsonl`);
+      const historyPath = path.join(
+        claudeProjectDirSync(candidate, { configDir }),
+        `${sessionId}.jsonl`,
+      );
       if (fs.existsSync(historyPath)) {
         return historyPath;
       }
     }
-    const sanitized = sanitizeClaudeProjectPath(cwd);
-    return path.join(configDir, "projects", sanitized, `${sessionId}.jsonl`);
+    return path.join(claudeProjectDirSync(cwd, { configDir }), `${sessionId}.jsonl`);
   }
 
   private convertHistoryEntry(entry: ClaudeHistoryEntry): AgentTimelineItem[] {
@@ -4818,7 +4925,8 @@ interface ClaudeSessionDescriptorAccumulator {
   sessionId: string | null;
   cwd: string | null;
   title: string | null;
-  timeline: AgentTimelineItem[];
+  firstPromptPreview: string | null;
+  lastPromptPreview: string | null;
 }
 
 function isFinishedAccumulator(acc: ClaudeSessionDescriptorAccumulator): boolean {
@@ -4851,22 +4959,18 @@ function applyClaudeSessionEntryToAccumulator(
       if (!acc.title) {
         acc.title = text;
       }
-      acc.timeline.push({ type: "user_message", text });
+      const preview = normalizeImportablePromptPreview(text);
+      acc.firstPromptPreview ??= preview;
+      acc.lastPromptPreview = preview;
     }
     return;
-  }
-  if (entry.type === "assistant" && entry.message) {
-    const text = extractClaudeUserText(entry.message);
-    if (text) {
-      acc.timeline.push({ type: "assistant_message", text });
-    }
   }
 }
 
 async function parseClaudeSessionDescriptor(
   filePath: string,
   mtime: Date,
-): Promise<PersistedAgentDescriptor | null> {
+): Promise<ImportableProviderSession | null> {
   let content: string;
   try {
     content = await fsPromises.readFile(filePath, "utf8");
@@ -4878,7 +4982,8 @@ async function parseClaudeSessionDescriptor(
     sessionId: null,
     cwd: null,
     title: null,
-    timeline: [],
+    firstPromptPreview: null,
+    lastPromptPreview: null,
   };
 
   for (const rawLine of content.split(/\r?\n/)) {
@@ -4896,31 +5001,26 @@ async function parseClaudeSessionDescriptor(
     }
   }
 
-  const { sessionId, cwd, title, timeline } = acc;
+  const { sessionId, cwd, title } = acc;
 
   if (!sessionId || !cwd) {
     return null;
   }
 
-  const persistence: AgentPersistenceHandle = {
-    provider: "claude",
-    sessionId,
-    nativeHandle: sessionId,
-    metadata: {
-      provider: "claude",
-      cwd,
-    },
-  };
-
   return {
-    provider: "claude",
-    sessionId,
+    providerHandleId: sessionId,
     cwd,
     title: (title ?? "").trim() || `Claude session ${sessionId.slice(0, 8)}`,
+    firstPromptPreview: acc.firstPromptPreview,
+    lastPromptPreview: acc.lastPromptPreview,
     lastActivityAt: mtime,
-    persistence,
-    timeline,
   };
+}
+
+function normalizeImportablePromptPreview(text: string): string | null {
+  const normalized = text.trim().replace(/\s+/g, " ");
+  if (!normalized) return null;
+  return normalized.length > 160 ? normalized.slice(0, 160) : normalized;
 }
 
 function extractClaudeUserText(messageRaw: unknown): string | null {

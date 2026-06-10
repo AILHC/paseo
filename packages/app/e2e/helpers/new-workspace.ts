@@ -1,10 +1,9 @@
-import { randomUUID } from "node:crypto";
 import { expect, type Page } from "@playwright/test";
 import type { DaemonClient as InternalDaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { decodeWorkspaceIdFromPathSegment } from "@/utils/host-routes";
-import { loadDaemonClientConstructor } from "./daemon-client-loader";
+import { connectDaemonClient } from "./daemon-client-loader";
+import { daemonWsRoutePattern } from "./daemon-port";
 import { expectWorkspaceHeader, workspaceLabelFromPath } from "./workspace-ui";
-import { createNodeWebSocketFactory, type NodeWebSocketFactory } from "./node-ws-factory";
 
 type NewWorkspaceDaemonClient = Pick<
   InternalDaemonClient,
@@ -16,13 +15,6 @@ type NewWorkspaceDaemonClient = Pick<
   | "openProject"
 >;
 
-interface NewWorkspaceDaemonClientConfig {
-  url: string;
-  clientId: string;
-  clientType: "cli";
-  webSocketFactory?: NodeWebSocketFactory;
-}
-
 type OpenProjectPayload = Awaited<ReturnType<NewWorkspaceDaemonClient["openProject"]>>;
 
 export interface OpenedProject {
@@ -30,21 +22,6 @@ export interface OpenedProject {
   projectKey: string;
   projectDisplayName: string;
   workspaceName: string;
-}
-
-function getDaemonPort(): string {
-  const daemonPort = process.env.E2E_DAEMON_PORT;
-  if (!daemonPort) {
-    throw new Error("E2E_DAEMON_PORT is not set.");
-  }
-  if (daemonPort === "6767") {
-    throw new Error("E2E_DAEMON_PORT must not point at the developer daemon.");
-  }
-  return daemonPort;
-}
-
-function getDaemonWsUrl(): string {
-  return `ws://127.0.0.1:${getDaemonPort()}/ws`;
 }
 
 function requireWorkspace(payload: OpenProjectPayload) {
@@ -69,19 +46,9 @@ function parseWorkspaceIdFromPageUrl(page: Page, serverId: string): string | nul
 }
 
 export async function connectNewWorkspaceDaemonClient(): Promise<NewWorkspaceDaemonClient> {
-  const DaemonClient = await loadDaemonClientConstructor<
-    NewWorkspaceDaemonClientConfig,
-    NewWorkspaceDaemonClient
-  >();
-  const webSocketFactory = createNodeWebSocketFactory();
-  const client = new DaemonClient({
-    url: getDaemonWsUrl(),
-    clientId: `app-e2e-new-workspace-${randomUUID()}`,
-    clientType: "cli",
-    webSocketFactory,
+  return connectDaemonClient<NewWorkspaceDaemonClient>({
+    clientIdPrefix: "app-e2e-new-workspace",
   });
-  await client.connect();
-  return client;
 }
 
 export async function openProjectViaDaemon(
@@ -157,19 +124,43 @@ export async function openNewWorkspaceComposer(
   });
 }
 
-export async function clickNewWorkspaceButton(
+export async function openGlobalNewWorkspaceComposer(page: Page): Promise<void> {
+  await page.getByTestId("sidebar-new-workspace").click();
+
+  await expect(page).toHaveURL(/\/h\/[^/]+\/new(?:\?.*)?$/, {
+    timeout: 30_000,
+  });
+}
+
+export async function expectNewWorkspaceProjectSelected(
   page: Page,
-  input: { projectKey: string; projectDisplayName: string; prompt?: string },
+  projectDisplayName: string,
 ): Promise<void> {
-  await openNewWorkspaceComposer(page, input);
+  const projectPicker = page.getByRole("button", { name: "Workspace project" });
+  await expect(projectPicker).toBeVisible({ timeout: 30_000 });
+  await expect(projectPicker).toContainText(projectDisplayName);
+}
+
+export async function submitNewWorkspacePrompt(
+  page: Page,
+  prompt = "Hello from e2e",
+): Promise<void> {
   const composer = page.getByRole("textbox", { name: "Message agent..." });
   await expect(composer).toBeVisible({ timeout: 30_000 });
-  await composer.fill(input.prompt ?? "Hello from e2e");
+  await composer.fill(prompt);
   const createButton = page
     .getByTestId("message-input-root")
     .getByRole("button", { name: "Create" });
   await expect(createButton).toBeVisible({ timeout: 30_000 });
   await createButton.click();
+}
+
+export async function clickNewWorkspaceButton(
+  page: Page,
+  input: { projectKey: string; projectDisplayName: string; prompt?: string },
+): Promise<void> {
+  await openNewWorkspaceComposer(page, input);
+  await submitNewWorkspacePrompt(page, input.prompt);
 }
 
 export async function openStartingRefPicker(page: Page): Promise<void> {
@@ -210,7 +201,9 @@ export async function selectPickerOptionByKeyboard(page: Page, label: string): P
   const searchInput = page.getByPlaceholder("Search branches and PRs");
   await expect(searchInput).toBeVisible({ timeout: 30_000 });
   await page.keyboard.type(label);
-  await page.keyboard.press("ArrowDown");
+  await expect(page.getByTestId(`new-workspace-ref-picker-branch-${label}`)).toBeVisible({
+    timeout: 10_000,
+  });
   await page.keyboard.press("Enter");
 }
 
@@ -245,7 +238,13 @@ export async function expectComposerGithubAttachmentPill(
 
 export async function assertNewWorkspaceSidebarAndHeader(
   page: Page,
-  input: { serverId: string; previousWorkspaceId: string; projectDisplayName: string },
+  input: {
+    serverId: string;
+    previousWorkspaceId: string;
+    projectDisplayName: string;
+    assertSidebarRow?: boolean;
+    assertHeader?: boolean;
+  },
 ): Promise<{ workspaceId: string }> {
   // Wait for URL to redirect to the newly created workspace.
   // Uses URL as source of truth to avoid picking up sidebar rows from concurrent tests.
@@ -263,15 +262,19 @@ export async function assertNewWorkspaceSidebarAndHeader(
     throw new Error(`Expected URL to redirect to a new workspace.\nCurrent URL: ${page.url()}`);
   }
 
-  const createdWorkspaceRow = page.getByTestId(
-    `sidebar-workspace-row-${input.serverId}:${workspaceId}`,
-  );
-  await expect(createdWorkspaceRow.first()).toBeVisible({ timeout: 30_000 });
+  if (input.assertSidebarRow !== false) {
+    const createdWorkspaceRow = page.getByTestId(
+      `sidebar-workspace-row-${input.serverId}:${workspaceId}`,
+    );
+    await expect(createdWorkspaceRow.first()).toBeVisible({ timeout: 30_000 });
+  }
 
-  await expectWorkspaceHeader(page, {
-    title: workspaceLabelFromPath(workspaceId),
-    subtitle: input.projectDisplayName,
-  });
+  if (input.assertHeader !== false) {
+    await expectWorkspaceHeader(page, {
+      title: workspaceLabelFromPath(workspaceId),
+      subtitle: input.projectDisplayName,
+    });
+  }
 
   return { workspaceId };
 }
@@ -316,12 +319,7 @@ export interface AgentCreatedDelayControl {
 export async function delayBrowserAgentCreatedStatus(
   page: Page,
 ): Promise<AgentCreatedDelayControl> {
-  const daemonPort = process.env.E2E_DAEMON_PORT;
-  if (!daemonPort) {
-    throw new Error("E2E_DAEMON_PORT is not set.");
-  }
-
-  const daemonPortPattern = new RegExp(`:${daemonPort.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`);
+  const daemonPortPattern = daemonWsRoutePattern();
   const createRequestIds = new Set<string>();
   const delayedForwards: Array<() => void> = [];
   let releaseRequested = false;

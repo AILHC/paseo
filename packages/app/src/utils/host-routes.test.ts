@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildHostAgentDetailRoute,
+  buildHostNewWorkspaceRoute,
   buildHostRootRoute,
   buildHostWorkspaceOpenRoute,
   buildHostWorkspaceRoute,
@@ -10,10 +11,12 @@ import {
   decodeWorkspaceIdFromPathSegment,
   encodeFilePathForPathSegment,
   encodeWorkspaceIdForPathSegment,
+  normalizeHostSectionSlug,
   parseHostAgentRouteFromPathname,
   parseHostWorkspaceOpenIntentFromPathname,
   parseHostWorkspaceRouteFromPathname,
   parseWorkspaceOpenIntent,
+  resolveKnownHostRoute,
 } from "./host-routes";
 
 describe("parseHostAgentRouteFromPathname", () => {
@@ -119,6 +122,19 @@ describe("workspace route parsing", () => {
     );
   });
 
+  it("builds a global new workspace route without a source directory", () => {
+    expect(buildHostNewWorkspaceRoute("local")).toBe("/h/local/new");
+  });
+
+  it("builds a project shortcut new workspace route with initial project context", () => {
+    expect(
+      buildHostNewWorkspaceRoute("local", "/repo/project", {
+        displayName: "Project",
+        projectId: "project-1",
+      }),
+    ).toBe("/h/local/new?dir=%2Frepo%2Fproject&name=Project&projectId=project-1");
+  });
+
   it("round-trips URL-safe IDs through encode/decode", () => {
     const ids = ["1", "40", "164", "9999", "workspace-1", "opaque_id.v2~test"];
     for (const id of ids) {
@@ -158,5 +174,49 @@ describe("projects settings routes", () => {
     const route = buildProjectSettingsRoute(projectKey);
     const segment = route.slice("/settings/projects/".length);
     expect(decodeURIComponent(segment)).toBe(projectKey);
+  });
+});
+
+describe("host settings section slugs", () => {
+  it("keeps current host settings sections", () => {
+    expect(normalizeHostSectionSlug("connections")).toBe("connections");
+    expect(normalizeHostSectionSlug("agents")).toBe("agents");
+    expect(normalizeHostSectionSlug("workspaces")).toBe("workspaces");
+    expect(normalizeHostSectionSlug("providers")).toBe("providers");
+    expect(normalizeHostSectionSlug("host")).toBe("host");
+  });
+
+  it("maps old host settings sections to their new names", () => {
+    expect(normalizeHostSectionSlug("orchestration")).toBe("agents");
+    expect(normalizeHostSectionSlug("daemon")).toBe("host");
+  });
+});
+
+describe("resolveKnownHostRoute", () => {
+  it("renders when the route host is still saved", () => {
+    expect(
+      resolveKnownHostRoute({
+        routeServerId: "srv-current",
+        hosts: [{ serverId: "srv-current" }, { serverId: "srv-next" }],
+      }),
+    ).toEqual({ kind: "render" });
+  });
+
+  it("sends removed host routes to the next saved host home", () => {
+    expect(
+      resolveKnownHostRoute({
+        routeServerId: "srv-removed",
+        hosts: [{ serverId: "srv-next" }],
+      }),
+    ).toEqual({ kind: "redirect", href: "/h/srv-next/open-project" });
+  });
+
+  it("sends host routes to welcome when no hosts are saved", () => {
+    expect(
+      resolveKnownHostRoute({
+        routeServerId: "srv-removed",
+        hosts: [],
+      }),
+    ).toEqual({ kind: "redirect", href: "/welcome" });
   });
 });

@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Image, Pressable, Text, TextInput, View } from "react-native";
+import { Pressable, Text, TextInput, View } from "react-native";
 import { router } from "expo-router";
 import { StyleSheet, useUnistyles } from "react-native-unistyles";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, Check, ChevronDown, MoreVertical, Pencil, Plus, X } from "lucide-react-native";
-import { useProjectIconQuery } from "@/hooks/use-project-icon-query";
+import { ProjectIconView } from "@/components/project-icon-view";
 import type {
   PaseoConfigRaw,
   PaseoConfigRevision,
@@ -28,6 +28,7 @@ import { SettingsGroup } from "@/screens/settings/settings-group";
 import { SettingsSection } from "@/screens/settings/settings-section";
 import { settingsStyles } from "@/styles/settings";
 import { useProjects } from "@/hooks/use-projects";
+import { useProjectIconDataByProjectKey } from "@/projects/project-icons";
 import { useHostRuntimeClient, useHostRuntimeSnapshot } from "@/runtime/host-runtime";
 import { useToast } from "@/contexts/toast-context";
 import { confirmDialog } from "@/utils/confirm-dialog";
@@ -218,6 +219,21 @@ function ProjectSettingsBody({
   });
 
   const data = readQuery.data;
+  const projectIconTargets = useMemo(
+    () => [
+      {
+        serverId: selectedHost.serverId,
+        projectKey: project.projectKey,
+        iconWorkingDir: selectedHost.repoRoot,
+      },
+    ],
+    [project.projectKey, selectedHost.repoRoot, selectedHost.serverId],
+  );
+  const projectIconDataByKey = useProjectIconDataByProjectKey({
+    serverId: null,
+    projects: projectIconTargets,
+  });
+  const projectIconDataUri = projectIconDataByKey.get(project.projectKey) ?? null;
   const loadedConfig: PaseoConfigRaw | null = data?.ok ? (data.config ?? {}) : null;
   const loadedRevision: PaseoConfigRevision | null = data?.ok ? data.revision : null;
   const readError: ProjectConfigRpcError | null = data && !data.ok ? data.error : null;
@@ -234,7 +250,11 @@ function ProjectSettingsBody({
 
       <View style={styles.headerBlock}>
         <View style={styles.titleRow}>
-          <ProjectTitleIcon host={selectedHost} projectName={project.projectName} />
+          <ProjectTitleIcon
+            iconDataUri={projectIconDataUri}
+            projectName={project.projectName}
+            projectKey={project.projectKey}
+          />
           <ProjectNameEditor project={project} client={client} />
         </View>
         <HostContext hosts={hosts} selectedHost={selectedHost} onSelectHost={onSelectHost} />
@@ -880,19 +900,25 @@ function ProjectNameEditor({ project, client }: ProjectNameEditorProps) {
   );
 }
 
-function ProjectTitleIcon({ host, projectName }: { host: ProjectHostEntry; projectName: string }) {
+function ProjectTitleIcon({
+  iconDataUri,
+  projectName,
+  projectKey,
+}: {
+  iconDataUri: string | null;
+  projectName: string;
+  projectKey: string;
+}) {
   const initial = projectName.trim().charAt(0).toUpperCase() || "?";
-  const { icon } = useProjectIconQuery({ serverId: host.serverId, cwd: host.repoRoot });
-  const iconDataUri =
-    icon && icon.data && icon.mimeType ? `data:${icon.mimeType};base64,${icon.data}` : null;
-  const imageSource = useMemo(() => ({ uri: iconDataUri ?? "" }), [iconDataUri]);
-  if (iconDataUri) {
-    return <Image source={imageSource} style={styles.titleIcon} />;
-  }
   return (
-    <View style={styles.titleIconFallback}>
-      <Text style={styles.titleIconFallbackText}>{initial}</Text>
-    </View>
+    <ProjectIconView
+      iconDataUri={iconDataUri}
+      initial={initial}
+      projectKey={projectKey}
+      imageStyle={styles.titleIcon}
+      fallbackStyle={styles.titleIconFallback}
+      textStyle={styles.titleIconFallbackText}
+    />
   );
 }
 
@@ -1288,12 +1314,10 @@ const styles = StyleSheet.create((theme) => ({
     width: 28,
     height: 28,
     borderRadius: theme.borderRadius.md,
-    backgroundColor: theme.colors.surface2,
     alignItems: "center",
     justifyContent: "center",
   },
   titleIconFallbackText: {
-    color: theme.colors.foregroundMuted,
     fontSize: theme.fontSize.sm,
     fontWeight: theme.fontWeight.medium,
   },

@@ -30,7 +30,7 @@ $PASEO_HOME/
 └── push-tokens.json                     # Expo push notification tokens
 ```
 
-The `agents/{sanitized-cwd}/` directory name is derived from the agent's `cwd` by stripping the filesystem root and replacing path separators with `-` (Windows drive letters become a `C-` style prefix). Atomic writes (temp file + rename): agent records, chat, project/workspace registries, push tokens. Non-atomic (plain `writeFile`): `config.json`, `schedules/*.json`, `loops/loops.json`, `server-id`, `daemon-keypair.json`.
+The `agents/{sanitized-cwd}/` directory name is derived from the agent's `cwd` by stripping the filesystem root and replacing path separators with `-` (Windows drive letters become a `C-` style prefix). Persistent server stores write atomically by writing a temp file in the target directory and then renaming it into place.
 
 ---
 
@@ -147,6 +147,9 @@ Single file, validated with `PersistedConfigSchema`.
   app: {
     baseUrl: string
   },
+  worktrees?: {
+    root?: string            // optional root for new worktrees; defaults to $PASEO_HOME/worktrees
+  },
   providers: {
     openai: { apiKey: string },
     local: { modelsDir: string }
@@ -155,7 +158,10 @@ Single file, validated with `PersistedConfigSchema`.
     // ProviderOverrideSchema; legacy entries with `command: { mode, ... }` are migrated to the
     // current shape on load via `migrateProviderSettings`. Custom provider IDs must declare
     // `extends` (one of the built-ins or `"acp"`) and `label`. See `provider-launch-config.ts`.
-    providers: Record<providerId, ProviderOverride>
+    providers: Record<providerId, ProviderOverride>,
+    metadataGeneration: {
+      providers: [{ provider, model?, thinkingOptionId? }]
+    }
   },
   features: {
     dictation: { enabled, stt: { provider, model, language, confidenceThreshold } },
@@ -171,6 +177,8 @@ Single file, validated with `PersistedConfigSchema`.
 
 All fields are optional with sensible defaults.
 
+`agents.metadataGeneration.providers` controls the preferred structured-generation fallback order for daemon-side metadata tasks such as commit messages, PR text, branch names, and generated agent titles. Entries are tried first in the configured order, then Paseo falls through to dynamically discovered defaults and finally the current selection when available.
+
 Local speech model ids are intentionally narrow: STT uses `parakeet-tdt-0.6b-v2-int8`, TTS uses `kokoro-en-v0_19`, and turn detection uses the bundled Silero VAD model.
 
 ---
@@ -179,7 +187,7 @@ Local speech model ids are intentionally narrow: STT uses `parakeet-tdt-0.6b-v2-
 
 **Path:** `$PASEO_HOME/schedules/{id}.json`
 
-One file per schedule. ID is 8 hex characters. Writes are direct (not atomic).
+One file per schedule. ID is 8 hex characters.
 
 | Field       | Type                                  | Description                      |
 | ----------- | ------------------------------------- | -------------------------------- |
@@ -201,7 +209,7 @@ One file per schedule. ID is 8 hex characters. Writes are direct (not atomic).
 ### Nested: ScheduleCadence (discriminated union on `type`)
 
 - `{ type: "every", everyMs: number }` — interval in milliseconds
-- `{ type: "cron", expression: string }` — cron expression
+- `{ type: "cron", expression: string, timezone?: string }` — cron expression; absent `timezone` means UTC, present `timezone` is an IANA time zone used for local wall-clock recurrence
 
 ### Nested: ScheduleTarget (discriminated union on `type`)
 

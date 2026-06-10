@@ -1,16 +1,19 @@
 import type { z } from "zod";
 import type { Logger } from "pino";
 import type { ProviderSnapshotManager } from "./provider-snapshot-manager.js";
-import type { AgentManager, ManagedAgent } from "./agent-manager.js";
+import type {
+  AgentManager,
+  ManagedAgent,
+  ManagedImportableProviderSession,
+} from "./agent-manager.js";
 import type { AgentStorage, StoredAgentRecord } from "./agent-storage.js";
 import type {
   AgentPersistenceHandle,
   AgentProvider,
-  AgentSessionConfig,
   AgentTimelineItem,
-  PersistedAgentDescriptor,
 } from "./agent-sdk-types.js";
 import { scheduleAgentMetadataGeneration } from "./agent-metadata-generator.js";
+import type { StructuredGenerationDaemonConfig } from "./structured-generation-providers.js";
 import { resolveCreateAgentTitles } from "./create-agent-title.js";
 import { unarchiveAgentState } from "./agent-prompt.js";
 import { toRecentProviderSessionDescriptorPayload } from "./agent-projections.js";
@@ -28,7 +31,7 @@ const METADATA_GENERATION_PROMPT_PREFIX =
   "Generate metadata for a coding agent based on the user prompt.";
 
 export interface NormalizedImportAgentRequest {
-  provider: string;
+  provider: AgentProvider;
   providerHandleId: string;
   cwd?: string;
   labels?: Record<string, string>;
@@ -47,7 +50,7 @@ export class ImportSessionsRequestError extends Error {
 
 export interface ListImportableProviderSessionsInput {
   request: FetchRecentProviderSessionsRequestMessage;
-  agentManager: Pick<AgentManager, "listAgents" | "listImportablePersistedAgents">;
+  agentManager: Pick<AgentManager, "listAgents" | "listImportableSessions">;
   agentStorage: Pick<AgentStorage, "list">;
   providerSnapshotManager: Pick<ProviderSnapshotManager, "getProviderLabel">;
 }
@@ -62,6 +65,8 @@ export interface ImportProviderSessionInput {
   agentManager: AgentManager;
   agentStorage: AgentStorage;
   workspaceGitService?: Pick<WorkspaceGitService, "resolveRepoRoot">;
+  providerSnapshotManager?: Pick<ProviderSnapshotManager, "listProviders">;
+  daemonConfig?: StructuredGenerationDaemonConfig | null;
   paseoHome?: string;
   logger: Logger;
   deps?: {
@@ -88,7 +93,7 @@ export function normalizeImportAgentRequest(
     return { error: "Import requires providerId and providerHandleId" };
   }
   return {
-    provider,
+    provider: provider as AgentProvider,
     providerHandleId,
     cwd: msg.cwd,
     labels: msg.labels,
@@ -105,34 +110,31 @@ export async function listImportableProviderSessions(
   const providerFilter = request.providers ? new Set(request.providers) : undefined;
   const importedHandles = await collectImportedProviderSessionHandles(agentManager, agentStorage);
 
-  const descriptors = await agentManager.listImportablePersistedAgents({
-    limit: 200,
+  const sessions = await agentManager.listImportableSessions({
+    limit,
     providerFilter,
     cwd: request.cwd,
   });
   let filteredAlreadyImportedCount = 0;
-  const candidates: PersistedAgentDescriptor[] = [];
+  const candidates: ManagedImportableProviderSession[] = [];
   const matchesRequestCwd = request.cwd ? createRealpathAwarePathMatcher(request.cwd) : null;
-  for (const descriptor of descriptors) {
-    if (matchesRequestCwd && !matchesRequestCwd(descriptor.cwd)) {
+  for (const session of sessions) {
+    if (matchesRequestCwd && !matchesRequestCwd(session.cwd)) {
       continue;
     }
-    if (sinceTimestamp !== null && descriptor.lastActivityAt.getTime() < sinceTimestamp) {
+    if (sinceTimestamp !== null && session.lastActivityAt.getTime() < sinceTimestamp) {
       continue;
     }
-    if (isMetadataGenerationDescriptor(descriptor)) {
+    if (isMetadataGenerationSession(session)) {
       continue;
     }
-    if (!hasUserPrompt(descriptor)) {
-      continue;
-    }
-    const providerHandleId =
-      descriptor.persistence.nativeHandle ?? descriptor.persistence.sessionId;
-    if (importedHandles.has(toProviderSessionHandleKey(descriptor.provider, providerHandleId))) {
+    if (
+      importedHandles.has(toProviderSessionHandleKey(session.provider, session.providerHandleId))
+    ) {
       filteredAlreadyImportedCount += 1;
       continue;
     }
-    candidates.push(descriptor);
+    candidates.push(session);
   }
 
   const entries = candidates
@@ -151,35 +153,25 @@ export async function importProviderSession(
   input: ImportProviderSessionInput,
 ): Promise<ImportProviderSessionResult> {
   const { provider, providerHandleId, cwd, labels } = input.request;
-  const descriptor = await input.agentManager.findPersistedAgent(provider, providerHandleId, {
-    cwd,
-  });
-  if (!descriptor && provider === "opencode" && !cwd) {
-    throw new Error(
-      "OpenCode sessions require --cwd when the session cannot be found in persisted agents",
-    );
+  if (!cwd) {
+    throw new Error("Import requires cwd from the selected provider session");
   }
 
-  const handle = descriptor
-    ? applyImportCwdOverride(descriptor.persistence, cwd)
-    : buildImportPersistenceHandle({ provider, providerHandleId, cwd });
-  const overrides = cwd ? ({ cwd } satisfies Partial<AgentSessionConfig>) : undefined;
-
+  const handle = buildImportPersistenceHandle({ provider, providerHandleId, cwd });
   await unarchiveAgentByHandle(input.agentStorage, input.agentManager, handle);
-  const snapshot = await input.agentManager.resumeAgentFromPersistence(
-    handle,
-    overrides,
-    undefined,
-    {
-      labels,
-    },
-  );
+  const snapshot = await input.agentManager.importProviderSession({
+    provider,
+    providerHandleId,
+    cwd,
+    labels,
+  });
   await unarchiveAgentState(input.agentStorage, input.agentManager, snapshot.id);
-  await input.agentManager.hydrateTimelineFromProvider(snapshot.id);
-  await applyImportedAgentTitle({
+  scheduleImportedAgentMetadata({
     snapshot,
     agentManager: input.agentManager,
     workspaceGitService: input.workspaceGitService,
+    providerSnapshotManager: input.providerSnapshotManager,
+    daemonConfig: input.daemonConfig,
     paseoHome: input.paseoHome,
     logger: input.logger,
     scheduleAgentMetadataGeneration:
@@ -201,7 +193,8 @@ async function unarchiveAgentByHandle(
   const matched = records.find(
     (record) =>
       record.persistence?.provider === handle.provider &&
-      record.persistence?.sessionId === handle.sessionId,
+      (record.persistence.sessionId === handle.sessionId ||
+        record.persistence.nativeHandle === handle.nativeHandle),
   );
   if (!matched) {
     return;
@@ -209,32 +202,41 @@ async function unarchiveAgentByHandle(
   await unarchiveAgentState(agentStorage, agentManager, matched.id);
 }
 
-async function applyImportedAgentTitle(input: {
+function scheduleImportedAgentMetadata(input: {
   snapshot: ManagedAgent;
   agentManager: AgentManager;
   workspaceGitService?: Pick<WorkspaceGitService, "resolveRepoRoot">;
+  providerSnapshotManager?: Pick<ProviderSnapshotManager, "listProviders">;
+  daemonConfig?: StructuredGenerationDaemonConfig | null;
   paseoHome?: string;
   logger: Logger;
   scheduleAgentMetadataGeneration: typeof scheduleAgentMetadataGeneration;
-}): Promise<void> {
+}): void {
   const initialPrompt = getFirstUserMessageText(input.agentManager.getTimeline(input.snapshot.id));
   if (!initialPrompt) {
     return;
   }
 
-  const { explicitTitle, provisionalTitle } = resolveCreateAgentTitles({
+  const { explicitTitle } = resolveCreateAgentTitles({
     configTitle: input.snapshot.config.title,
     initialPrompt,
   });
-  if (!explicitTitle && provisionalTitle) {
-    await input.agentManager.setTitle(input.snapshot.id, provisionalTitle);
-  }
 
   input.scheduleAgentMetadataGeneration({
     agentManager: input.agentManager,
     agentId: input.snapshot.id,
     cwd: input.snapshot.cwd,
     workspaceGitService: input.workspaceGitService,
+    providerSnapshotManager: input.providerSnapshotManager,
+    daemonConfig: input.daemonConfig,
+    currentSelection: {
+      provider: input.snapshot.provider,
+      model: input.snapshot.runtimeInfo?.model ?? input.snapshot.config.model,
+      thinkingOptionId:
+        input.snapshot.runtimeInfo?.thinkingOptionId ??
+        input.snapshot.config.thinkingOptionId ??
+        null,
+    },
     initialPrompt,
     explicitTitle,
     paseoHome: input.paseoHome,
@@ -254,36 +256,17 @@ function parseRecentProviderSessionsSince(since: string | undefined): number | n
 }
 
 function buildImportPersistenceHandle(input: {
-  provider: AgentProvider;
+  provider: string;
   providerHandleId: string;
-  cwd?: string;
+  cwd: string;
 }): AgentPersistenceHandle {
-  const cwd = input.cwd ?? process.cwd();
   return {
     provider: input.provider,
     sessionId: input.providerHandleId,
     nativeHandle: input.providerHandleId,
     metadata: {
       provider: input.provider,
-      cwd,
-    },
-  };
-}
-
-function applyImportCwdOverride(
-  handle: AgentPersistenceHandle,
-  cwd: string | undefined,
-): AgentPersistenceHandle {
-  if (!cwd) {
-    return handle;
-  }
-
-  return {
-    ...handle,
-    metadata: {
-      ...handle.metadata,
-      provider: handle.provider,
-      cwd,
+      cwd: input.cwd,
     },
   };
 }
@@ -322,17 +305,9 @@ function toProviderSessionHandleKey(provider: string, providerHandleId: string):
   return `${provider}\0${providerHandleId}`;
 }
 
-function isMetadataGenerationDescriptor(descriptor: PersistedAgentDescriptor): boolean {
-  for (const item of descriptor.timeline) {
-    if (item.type !== "user_message") continue;
-    return item.text.trimStart().startsWith(METADATA_GENERATION_PROMPT_PREFIX);
-  }
-  return false;
-}
-
-function hasUserPrompt(descriptor: PersistedAgentDescriptor): boolean {
-  return descriptor.timeline.some(
-    (item) => item.type === "user_message" && item.text.trim() !== "",
+function isMetadataGenerationSession(input: { firstPromptPreview: string | null }): boolean {
+  return (
+    input.firstPromptPreview?.trimStart().startsWith(METADATA_GENERATION_PROMPT_PREFIX) ?? false
   );
 }
 

@@ -32,12 +32,6 @@ export function SiteFooter({ width = "default" }: SiteFooterProps) {
               Changelog
             </a>
             <a
-              href="/cloud"
-              className="block text-muted-foreground hover:text-foreground transition-colors"
-            >
-              Cloud
-            </a>
-            <a
               href="/docs/cli"
               className="block text-muted-foreground hover:text-foreground transition-colors"
             >
@@ -48,6 +42,12 @@ export function SiteFooter({ width = "default" }: SiteFooterProps) {
               className="block text-muted-foreground hover:text-foreground transition-colors"
             >
               Privacy
+            </a>
+            <a
+              href="/sponsor"
+              className="block text-muted-foreground hover:text-foreground transition-colors"
+            >
+              Sponsor
             </a>
           </div>
         </div>

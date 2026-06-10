@@ -11,6 +11,7 @@
 import { Route as rootRouteImport } from "./routes/__root";
 import { Route as VtcodeRouteImport } from "./routes/vtcode";
 import { Route as StakpakRouteImport } from "./routes/stakpak";
+import { Route as SponsorRouteImport } from "./routes/sponsor";
 import { Route as SigitRouteImport } from "./routes/sigit";
 import { Route as QwenCodeRouteImport } from "./routes/qwen-code";
 import { Route as QoderRouteImport } from "./routes/qoder";
@@ -18,6 +19,7 @@ import { Route as PrivacyRouteImport } from "./routes/privacy";
 import { Route as PoolsideRouteImport } from "./routes/poolside";
 import { Route as PiRouteImport } from "./routes/pi";
 import { Route as OpencodeRouteImport } from "./routes/opencode";
+import { Route as OmpRouteImport } from "./routes/omp";
 import { Route as NovaRouteImport } from "./routes/nova";
 import { Route as MistralVibeRouteImport } from "./routes/mistral-vibe";
 import { Route as MinionCodeRouteImport } from "./routes/minion-code";
@@ -25,6 +27,7 @@ import { Route as KimiRouteImport } from "./routes/kimi";
 import { Route as KiloRouteImport } from "./routes/kilo";
 import { Route as JunieRouteImport } from "./routes/junie";
 import { Route as HermesRouteImport } from "./routes/hermes";
+import { Route as GrokRouteImport } from "./routes/grok";
 import { Route as GooseRouteImport } from "./routes/goose";
 import { Route as GlmRouteImport } from "./routes/glm";
 import { Route as GeminiRouteImport } from "./routes/gemini";
@@ -69,6 +72,11 @@ const StakpakRoute = StakpakRouteImport.update({
   path: "/stakpak",
   getParentRoute: () => rootRouteImport,
 } as any);
+const SponsorRoute = SponsorRouteImport.update({
+  id: "/sponsor",
+  path: "/sponsor",
+  getParentRoute: () => rootRouteImport,
+} as any);
 const SigitRoute = SigitRouteImport.update({
   id: "/sigit",
   path: "/sigit",
@@ -104,6 +112,11 @@ const OpencodeRoute = OpencodeRouteImport.update({
   path: "/opencode",
   getParentRoute: () => rootRouteImport,
 } as any);
+const OmpRoute = OmpRouteImport.update({
+  id: "/omp",
+  path: "/omp",
+  getParentRoute: () => rootRouteImport,
+} as any);
 const NovaRoute = NovaRouteImport.update({
   id: "/nova",
   path: "/nova",
@@ -137,6 +150,11 @@ const JunieRoute = JunieRouteImport.update({
 const HermesRoute = HermesRouteImport.update({
   id: "/hermes",
   path: "/hermes",
+  getParentRoute: () => rootRouteImport,
+} as any);
+const GrokRoute = GrokRouteImport.update({
+  id: "/grok",
+  path: "/grok",
   getParentRoute: () => rootRouteImport,
 } as any);
 const GooseRoute = GooseRouteImport.update({
@@ -335,6 +353,7 @@ export interface FileRoutesByFullPath {
   "/gemini": typeof GeminiRoute;
   "/glm": typeof GlmRoute;
   "/goose": typeof GooseRoute;
+  "/grok": typeof GrokRoute;
   "/hermes": typeof HermesRoute;
   "/junie": typeof JunieRoute;
   "/kilo": typeof KiloRoute;
@@ -342,6 +361,7 @@ export interface FileRoutesByFullPath {
   "/minion-code": typeof MinionCodeRoute;
   "/mistral-vibe": typeof MistralVibeRoute;
   "/nova": typeof NovaRoute;
+  "/omp": typeof OmpRoute;
   "/opencode": typeof OpencodeRoute;
   "/pi": typeof PiRoute;
   "/poolside": typeof PoolsideRoute;
@@ -349,6 +369,7 @@ export interface FileRoutesByFullPath {
   "/qoder": typeof QoderRoute;
   "/qwen-code": typeof QwenCodeRoute;
   "/sigit": typeof SigitRoute;
+  "/sponsor": typeof SponsorRoute;
   "/stakpak": typeof StakpakRoute;
   "/vtcode": typeof VtcodeRoute;
   "/blog/$": typeof BlogSplatRoute;
@@ -384,6 +405,7 @@ export interface FileRoutesByTo {
   "/gemini": typeof GeminiRoute;
   "/glm": typeof GlmRoute;
   "/goose": typeof GooseRoute;
+  "/grok": typeof GrokRoute;
   "/hermes": typeof HermesRoute;
   "/junie": typeof JunieRoute;
   "/kilo": typeof KiloRoute;
@@ -391,6 +413,7 @@ export interface FileRoutesByTo {
   "/minion-code": typeof MinionCodeRoute;
   "/mistral-vibe": typeof MistralVibeRoute;
   "/nova": typeof NovaRoute;
+  "/omp": typeof OmpRoute;
   "/opencode": typeof OpencodeRoute;
   "/pi": typeof PiRoute;
   "/poolside": typeof PoolsideRoute;
@@ -398,6 +421,7 @@ export interface FileRoutesByTo {
   "/qoder": typeof QoderRoute;
   "/qwen-code": typeof QwenCodeRoute;
   "/sigit": typeof SigitRoute;
+  "/sponsor": typeof SponsorRoute;
   "/stakpak": typeof StakpakRoute;
   "/vtcode": typeof VtcodeRoute;
   "/blog/$": typeof BlogSplatRoute;
@@ -436,6 +460,7 @@ export interface FileRoutesById {
   "/gemini": typeof GeminiRoute;
   "/glm": typeof GlmRoute;
   "/goose": typeof GooseRoute;
+  "/grok": typeof GrokRoute;
   "/hermes": typeof HermesRoute;
   "/junie": typeof JunieRoute;
   "/kilo": typeof KiloRoute;
@@ -443,6 +468,7 @@ export interface FileRoutesById {
   "/minion-code": typeof MinionCodeRoute;
   "/mistral-vibe": typeof MistralVibeRoute;
   "/nova": typeof NovaRoute;
+  "/omp": typeof OmpRoute;
   "/opencode": typeof OpencodeRoute;
   "/pi": typeof PiRoute;
   "/poolside": typeof PoolsideRoute;
@@ -450,6 +476,7 @@ export interface FileRoutesById {
   "/qoder": typeof QoderRoute;
   "/qwen-code": typeof QwenCodeRoute;
   "/sigit": typeof SigitRoute;
+  "/sponsor": typeof SponsorRoute;
   "/stakpak": typeof StakpakRoute;
   "/vtcode": typeof VtcodeRoute;
   "/blog/$": typeof BlogSplatRoute;
@@ -489,6 +516,7 @@ export interface FileRouteTypes {
     | "/gemini"
     | "/glm"
     | "/goose"
+    | "/grok"
     | "/hermes"
     | "/junie"
     | "/kilo"
@@ -496,6 +524,7 @@ export interface FileRouteTypes {
     | "/minion-code"
     | "/mistral-vibe"
     | "/nova"
+    | "/omp"
     | "/opencode"
     | "/pi"
     | "/poolside"
@@ -503,6 +532,7 @@ export interface FileRouteTypes {
     | "/qoder"
     | "/qwen-code"
     | "/sigit"
+    | "/sponsor"
     | "/stakpak"
     | "/vtcode"
     | "/blog/$"
@@ -538,6 +568,7 @@ export interface FileRouteTypes {
     | "/gemini"
     | "/glm"
     | "/goose"
+    | "/grok"
     | "/hermes"
     | "/junie"
     | "/kilo"
@@ -545,6 +576,7 @@ export interface FileRouteTypes {
     | "/minion-code"
     | "/mistral-vibe"
     | "/nova"
+    | "/omp"
     | "/opencode"
     | "/pi"
     | "/poolside"
@@ -552,6 +584,7 @@ export interface FileRouteTypes {
     | "/qoder"
     | "/qwen-code"
     | "/sigit"
+    | "/sponsor"
     | "/stakpak"
     | "/vtcode"
     | "/blog/$"
@@ -589,6 +622,7 @@ export interface FileRouteTypes {
     | "/gemini"
     | "/glm"
     | "/goose"
+    | "/grok"
     | "/hermes"
     | "/junie"
     | "/kilo"
@@ -596,6 +630,7 @@ export interface FileRouteTypes {
     | "/minion-code"
     | "/mistral-vibe"
     | "/nova"
+    | "/omp"
     | "/opencode"
     | "/pi"
     | "/poolside"
@@ -603,6 +638,7 @@ export interface FileRouteTypes {
     | "/qoder"
     | "/qwen-code"
     | "/sigit"
+    | "/sponsor"
     | "/stakpak"
     | "/vtcode"
     | "/blog/$"
@@ -641,6 +677,7 @@ export interface RootRouteChildren {
   GeminiRoute: typeof GeminiRoute;
   GlmRoute: typeof GlmRoute;
   GooseRoute: typeof GooseRoute;
+  GrokRoute: typeof GrokRoute;
   HermesRoute: typeof HermesRoute;
   JunieRoute: typeof JunieRoute;
   KiloRoute: typeof KiloRoute;
@@ -648,6 +685,7 @@ export interface RootRouteChildren {
   MinionCodeRoute: typeof MinionCodeRoute;
   MistralVibeRoute: typeof MistralVibeRoute;
   NovaRoute: typeof NovaRoute;
+  OmpRoute: typeof OmpRoute;
   OpencodeRoute: typeof OpencodeRoute;
   PiRoute: typeof PiRoute;
   PoolsideRoute: typeof PoolsideRoute;
@@ -655,6 +693,7 @@ export interface RootRouteChildren {
   QoderRoute: typeof QoderRoute;
   QwenCodeRoute: typeof QwenCodeRoute;
   SigitRoute: typeof SigitRoute;
+  SponsorRoute: typeof SponsorRoute;
   StakpakRoute: typeof StakpakRoute;
   VtcodeRoute: typeof VtcodeRoute;
 }
@@ -673,6 +712,13 @@ declare module "@tanstack/react-router" {
       path: "/stakpak";
       fullPath: "/stakpak";
       preLoaderRoute: typeof StakpakRouteImport;
+      parentRoute: typeof rootRouteImport;
+    };
+    "/sponsor": {
+      id: "/sponsor";
+      path: "/sponsor";
+      fullPath: "/sponsor";
+      preLoaderRoute: typeof SponsorRouteImport;
       parentRoute: typeof rootRouteImport;
     };
     "/sigit": {
@@ -724,6 +770,13 @@ declare module "@tanstack/react-router" {
       preLoaderRoute: typeof OpencodeRouteImport;
       parentRoute: typeof rootRouteImport;
     };
+    "/omp": {
+      id: "/omp";
+      path: "/omp";
+      fullPath: "/omp";
+      preLoaderRoute: typeof OmpRouteImport;
+      parentRoute: typeof rootRouteImport;
+    };
     "/nova": {
       id: "/nova";
       path: "/nova";
@@ -771,6 +824,13 @@ declare module "@tanstack/react-router" {
       path: "/hermes";
       fullPath: "/hermes";
       preLoaderRoute: typeof HermesRouteImport;
+      parentRoute: typeof rootRouteImport;
+    };
+    "/grok": {
+      id: "/grok";
+      path: "/grok";
+      fullPath: "/grok";
+      preLoaderRoute: typeof GrokRouteImport;
       parentRoute: typeof rootRouteImport;
     };
     "/goose": {
@@ -1061,6 +1121,7 @@ const rootRouteChildren: RootRouteChildren = {
   GeminiRoute: GeminiRoute,
   GlmRoute: GlmRoute,
   GooseRoute: GooseRoute,
+  GrokRoute: GrokRoute,
   HermesRoute: HermesRoute,
   JunieRoute: JunieRoute,
   KiloRoute: KiloRoute,
@@ -1068,6 +1129,7 @@ const rootRouteChildren: RootRouteChildren = {
   MinionCodeRoute: MinionCodeRoute,
   MistralVibeRoute: MistralVibeRoute,
   NovaRoute: NovaRoute,
+  OmpRoute: OmpRoute,
   OpencodeRoute: OpencodeRoute,
   PiRoute: PiRoute,
   PoolsideRoute: PoolsideRoute,
@@ -1075,6 +1137,7 @@ const rootRouteChildren: RootRouteChildren = {
   QoderRoute: QoderRoute,
   QwenCodeRoute: QwenCodeRoute,
   SigitRoute: SigitRoute,
+  SponsorRoute: SponsorRoute,
   StakpakRoute: StakpakRoute,
   VtcodeRoute: VtcodeRoute,
 };
