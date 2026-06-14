@@ -9,6 +9,7 @@ import * as executableUtils from "../../../../utils/executable.js";
 import {
   ClaudeAgentClient,
   convertClaudeHistoryEntry,
+  normalizeClaudeAskUserQuestionRequestInput,
   normalizeClaudeAskUserQuestionUpdatedInput,
   toClaudeSdkMcpConfig,
 } from "./agent.js";
@@ -614,6 +615,37 @@ describe("ClaudeAgentSession features", () => {
 });
 
 describe("normalizeClaudeAskUserQuestionUpdatedInput", () => {
+  test("marks Claude AskUserQuestion options as allowing other answers", () => {
+    expect(
+      normalizeClaudeAskUserQuestionRequestInput("AskUserQuestion", {
+        questions: [
+          {
+            question: "Which provider should I use?",
+            header: "Provider",
+            options: [
+              { label: "Claude", description: "Use Claude Code" },
+              { label: "Codex", description: "Use Codex" },
+            ],
+            multiSelect: false,
+          },
+        ],
+      }),
+    ).toEqual({
+      questions: [
+        {
+          question: "Which provider should I use?",
+          header: "Provider",
+          options: [
+            { label: "Claude", description: "Use Claude Code" },
+            { label: "Codex", description: "Use Codex" },
+          ],
+          multiSelect: false,
+          allowOther: true,
+        },
+      ],
+    });
+  });
+
   test("maps frontend header-keyed answers to Claude question text keys", () => {
     expect(
       normalizeClaudeAskUserQuestionUpdatedInput(
@@ -739,6 +771,86 @@ describe("normalizeClaudeAskUserQuestionUpdatedInput", () => {
             },
           ],
           answers: { "Which provider should I use?": "Claude" },
+        },
+        updatedPermissions: undefined,
+      });
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("respondToPermission maps other answer text back to Claude question keys", async () => {
+    const client = new ClaudeAgentClient({
+      logger: createTestLogger(),
+      resolveBinary: async () => "/test/claude/bin",
+    });
+    const session = await client.createSession({
+      provider: "claude",
+      cwd: process.cwd(),
+    });
+
+    const request = {
+      id: "permission-question-2",
+      provider: "claude",
+      name: "AskUserQuestion",
+      kind: "question",
+      input: normalizeClaudeAskUserQuestionRequestInput("AskUserQuestion", {
+        questions: [
+          {
+            question: "Which provider should I use?",
+            header: "Provider",
+            options: [
+              { label: "Claude", description: "Use Claude Code" },
+              { label: "Codex", description: "Use Codex" },
+            ],
+            multiSelect: false,
+          },
+        ],
+      }),
+    };
+
+    const resultPromise = new Promise<unknown>((resolve, reject) => {
+      (
+        session as unknown as {
+          pendingPermissions: Map<
+            string,
+            {
+              request: typeof request;
+              resolve: (value: unknown) => void;
+              reject: (error: Error) => void;
+            }
+          >;
+        }
+      ).pendingPermissions.set(request.id, {
+        request,
+        resolve,
+        reject,
+      });
+    });
+
+    try {
+      await session.respondToPermission(request.id, {
+        behavior: "allow",
+        updatedInput: {
+          answers: { Provider: "Use both" },
+        },
+      });
+
+      await expect(resultPromise).resolves.toEqual({
+        behavior: "allow",
+        updatedInput: {
+          questions: [
+            {
+              question: "Which provider should I use?",
+              header: "Provider",
+              options: [
+                { label: "Claude", description: "Use Claude Code" },
+                { label: "Codex", description: "Use Codex" },
+              ],
+              multiSelect: false,
+            },
+          ],
+          answers: { "Which provider should I use?": "Use both" },
         },
         updatedPermissions: undefined,
       });
@@ -885,6 +997,88 @@ describe("ClaudeAgentSession context window usage", () => {
     await persistedSession.close();
 
     expect(persistedQueryFactory.mock.calls[0]?.[0].options.persistSession).toBe(true);
+  });
+
+  test("classifies Claude root-only commands separately from inline skills", async () => {
+    const queryFactory = vi.fn(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+      void prompt;
+      return {
+        next: async () => ({ done: true, value: undefined }),
+        interrupt: async () => undefined,
+        return: async () => undefined,
+        close: () => undefined,
+        setPermissionMode: async () => undefined,
+        setModel: async () => undefined,
+        supportedModels: async () => [],
+        supportedCommands: async () => [
+          {
+            name: "taste",
+            description: "Use when another skill needs the shared standard. (user)",
+            argumentHint: "",
+          },
+          {
+            name: "claude-api",
+            description: "Build, debug, and optimize Claude API apps with this skill.",
+            argumentHint: "",
+          },
+          {
+            name: "usage",
+            description: "Show the total cost and duration of the current session",
+            argumentHint: "",
+          },
+          {
+            name: "clear",
+            description: "Start a new session with empty context",
+            argumentHint: "",
+          },
+        ],
+        rewindFiles: async () => ({ canRewind: true }),
+        [Symbol.asyncIterator]() {
+          return this;
+        },
+      };
+    });
+    const client = new ClaudeAgentClient({
+      logger,
+      queryFactory,
+      resolveBinary: async () => "/test/claude/bin",
+    });
+    const session = await client.createSession({ provider: "claude", cwd: process.cwd() });
+
+    const commands = await session.listCommands();
+    await session.close();
+
+    expect(commands).toEqual([
+      {
+        name: "claude-api",
+        description: "Build, debug, and optimize Claude API apps with this skill.",
+        argumentHint: "",
+        kind: "skill",
+      },
+      {
+        name: "clear",
+        description: "Start a new session with empty context",
+        argumentHint: "",
+        kind: "command",
+      },
+      {
+        name: "rewind",
+        description: "Rewind tracked files to a previous user message",
+        argumentHint: "[user_message_uuid]",
+      },
+      {
+        name: "taste",
+        description: "Use when another skill needs the shared standard. (user)",
+        argumentHint: "",
+        kind: "skill",
+      },
+      {
+        name: "usage",
+        description: "Show the total cost and duration of the current session",
+        argumentHint: "",
+        kind: "command",
+      },
+    ]);
   });
 
   test("deletes the persisted session jsonl on close when persistSession=false", async () => {

@@ -513,6 +513,7 @@ function createSessionForWorkspaceTests(
         archive: async () => {},
         remove: async () => {},
       },
+      filesystem: { isDirectory: async () => true },
       chatService: asChatService(),
       scheduleService: asScheduleService(),
       loopService: asLoopService(),
@@ -522,6 +523,7 @@ function createSessionForWorkspaceTests(
           unsubscribe: () => {},
         }),
         scheduleRefreshForCwd: () => {},
+        onWorkspaceStateMayHaveChanged: () => {},
         getMetrics: () => ({
           checkoutDiffTargetCount: 0,
           checkoutDiffSubscriptionCount: 0,
@@ -632,6 +634,7 @@ test("create_agent_request keeps requested child cwd when grouped under an exist
             unsubscribe: () => {},
           }),
           scheduleRefreshForCwd: () => {},
+          onWorkspaceStateMayHaveChanged: () => {},
           getMetrics: () => ({
             checkoutDiffTargetCount: 0,
             checkoutDiffSubscriptionCount: 0,
@@ -1014,6 +1017,7 @@ test("archive_agent_request is disabled and does not archive the agent", async (
           unsubscribe: () => {},
         }),
         scheduleRefreshForCwd: () => {},
+        onWorkspaceStateMayHaveChanged: () => {},
         getMetrics: () => ({
           checkoutDiffTargetCount: 0,
           checkoutDiffSubscriptionCount: 0,
@@ -1374,6 +1378,7 @@ test("close_items_request ignores agents and still kills terminals", async () =>
           unsubscribe: () => {},
         }),
         scheduleRefreshForCwd: () => {},
+        onWorkspaceStateMayHaveChanged: () => {},
         getMetrics: () => ({
           checkoutDiffTargetCount: 0,
           checkoutDiffSubscriptionCount: 0,
@@ -1546,6 +1551,7 @@ test("close_items_request ignores stored agents that are not currently loaded", 
           unsubscribe: () => {},
         }),
         scheduleRefreshForCwd: () => {},
+        onWorkspaceStateMayHaveChanged: () => {},
         getMetrics: () => ({
           checkoutDiffTargetCount: 0,
           checkoutDiffSubscriptionCount: 0,
@@ -1678,6 +1684,7 @@ test("close_items_request continues after a terminal failure", async () => {
           unsubscribe: () => {},
         }),
         scheduleRefreshForCwd: () => {},
+        onWorkspaceStateMayHaveChanged: () => {},
         getMetrics: () => ({
           checkoutDiffTargetCount: 0,
           checkoutDiffSubscriptionCount: 0,
@@ -2662,6 +2669,7 @@ test("workspace update stream keeps persisted workspace visible after agents sto
           unsubscribe: () => {},
         }),
         scheduleRefreshForCwd: () => {},
+        onWorkspaceStateMayHaveChanged: () => {},
         getMetrics: () => ({
           checkoutDiffTargetCount: 0,
           checkoutDiffSubscriptionCount: 0,
